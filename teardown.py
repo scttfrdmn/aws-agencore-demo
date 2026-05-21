@@ -170,12 +170,21 @@ if __name__ == "__main__":
 
     # --- S3 corpus bucket -------------------------------------------------
     # WARNING: this deletes all the papers you downloaded with corpus_fetch.py.
-    # The local corpus/ directory on your laptop is NOT deleted.
     # Re-run corpus_fetch.py + aws s3 sync to rebuild if needed.
     _try(
         f"S3 corpus bucket {cfg.BUCKET}",
         lambda: _delete_bucket(cfg.BUCKET),
     )
 
+    # Delete the local corpus/ directory if it exists.
+    import os
+    import shutil
+
+    corpus_dir = "corpus"
+    if os.path.isdir(corpus_dir):
+        shutil.rmtree(corpus_dir)
+        print(f"  deleted: local {corpus_dir}/ directory")
+    else:
+        print(f"  skip (local {corpus_dir}/): not present")
+
     print("\nDone.")
-    print("Note: local corpus/ directory was NOT deleted -- remove it manually if needed.")
