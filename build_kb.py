@@ -21,12 +21,12 @@ What this script creates (in order):
                   tool access control.  The Cedar "ForbidWeb" policy denies
                   the web_fetch tool call that Q4 attempts.
 
-Re-running safely:
-  The script is idempotent for the IAM role and S3 Vectors steps: if the
-  resource already exists, those steps print a notice and continue.
-  The Knowledge Base, Guardrail, and Gateway are NOT idempotent -- running
-  twice will create a second set.  If you need to re-run, run teardown.py
-  first, then re-run this script.
+Re-running safely (idempotent):
+  All six steps use get-or-create logic -- if a resource with the expected
+  name already exists, the script returns its existing ID instead of creating
+  a duplicate.  You can run this script multiple times safely; it will print
+  "exists" for steps that are already done and only do real work for steps
+  that are missing.  This means you can also re-run after a partial failure.
 
 >>> VERIFY BEFORE RUNNING <<<
 S3 Vectors is a recent service (GA 2025).  The `s3vectors` boto3 client
@@ -226,21 +226,43 @@ def create_kb(role_arn: str, index_arn: str) -> tuple[str, str]:
     """
     embed_arn = f"arn:aws:bedrock:{cfg.REGION}::foundation-model/{cfg.EMBED_MODEL_ID}"
 
-    # VERIFY: storageConfiguration shape for S3 Vectors against current boto3.
-    # As of 2026-05-20, type "S3_VECTORS" with s3VectorsConfiguration.indexArn works.
-    kb = agent.create_knowledge_base(
-        name=cfg.KB_NAME,
-        roleArn=role_arn,
-        knowledgeBaseConfiguration={
-            "type": "VECTOR",
-            "vectorKnowledgeBaseConfiguration": {"embeddingModelArn": embed_arn},
-        },
-        storageConfiguration={
-            "type": "S3_VECTORS",
-            "s3VectorsConfiguration": {"indexArn": index_arn},
-        },
-    )
-    kb_id = kb["knowledgeBase"]["knowledgeBaseId"]
+    # Get-or-create: if a KB with this name already exists, reuse it.
+    existing = [
+        kb
+        for kb in agent.list_knowledge_bases().get("knowledgeBaseSummaries", [])
+        if kb["name"] == cfg.KB_NAME
+    ]
+    if existing:
+        kb_id = existing[0]["knowledgeBaseId"]
+        print(f"  knowledge base exists: {kb_id}")
+    else:
+        # VERIFY: storageConfiguration shape for S3 Vectors against current boto3.
+        # As of 2026-05-20, type "S3_VECTORS" with s3VectorsConfiguration.indexArn works.
+        kb = agent.create_knowledge_base(
+            name=cfg.KB_NAME,
+            roleArn=role_arn,
+            knowledgeBaseConfiguration={
+                "type": "VECTOR",
+                "vectorKnowledgeBaseConfiguration": {"embeddingModelArn": embed_arn},
+            },
+            storageConfiguration={
+                "type": "S3_VECTORS",
+                "s3VectorsConfiguration": {"indexArn": index_arn},
+            },
+        )
+        kb_id = kb["knowledgeBase"]["knowledgeBaseId"]
+        print(f"  knowledge base: {kb_id}")
+
+    # Get-or-create the data source (pmc-corpus) within this KB.
+    existing_ds = [
+        ds
+        for ds in agent.list_data_sources(knowledgeBaseId=kb_id).get("dataSourceSummaries", [])
+        if ds["name"] == "pmc-corpus"
+    ]
+    if existing_ds:
+        ds_id = existing_ds[0]["dataSourceId"]
+        print(f"  data source exists: {ds_id}")
+        return kb_id, ds_id
 
     # The data source tells Bedrock which S3 prefix to read papers from.
     # inclusionPrefixes limits ingestion to corpus/ -- other S3 objects are ignored.
@@ -333,8 +355,21 @@ def create_guardrail() -> tuple[str, str]:
         (guardrail_id, version) -- paste both into config.py.
     """
     br = boto3.client("bedrock", region_name=cfg.REGION)
+
+    # Get-or-create: check if a guardrail with this name already exists.
+    existing = [
+        g
+        for g in br.list_guardrails().get("guardrails", [])
+        if g["name"] == "inside-the-lines-url-filter"
+    ]
+    if existing:
+        gid = existing[0]["id"]
+        ver = existing[0].get("version", "DRAFT")
+        print(f"  guardrail exists: {gid}")
+        return gid, ver
+
     resp = br.create_guardrail(
-        name="inside-the-lines-url-guard",
+        name="inside-the-lines-url-filter",
         description="Intercept external URLs in model output for the Inside the Lines demo.",
         sensitiveInformationPolicyConfig={
             "regexesConfig": [
@@ -441,78 +476,126 @@ def create_gateway() -> dict:
     # Wait for IAM propagation before creating the gateway.
     time.sleep(8)
 
-    # b. PolicyEngine -- the Cedar evaluation service instance.
-    #    Wait up to 60 seconds for it to reach ACTIVE.
-    pe = br_ctrl.create_policy_engine(name="InsideTheLinesEngine")
-    engine_id = pe["policyEngineId"]
-    engine_arn = pe["policyEngineArn"]
-    print(f"  policy engine: {engine_id}")
-    for _ in range(20):
-        if br_ctrl.get_policy_engine(policyEngineId=engine_id)["status"] == "ACTIVE":
-            break
-        time.sleep(3)
+    # b. PolicyEngine -- get-or-create by name.
+    #    IMPORTANT: list_policy_engines() returns empty even when an engine exists
+    #    (a known API quirk as of 2026-05-21).  We therefore use try/create and catch
+    #    ConflictException instead of relying on the list call.
+    #    When a ConflictException fires we search the config for the existing engine ID;
+    #    if config.py has GATEWAY_ENGINE_ID set we use it, otherwise we paginate
+    #    list_policy_engines() anyway (it may start working in future SDK versions).
+    try:
+        pe = br_ctrl.create_policy_engine(name="InsideTheLinesEngine")
+        engine_id = pe["policyEngineId"]
+        engine_arn = pe["policyEngineArn"]
+        print(f"  policy engine: {engine_id}")
+        for _ in range(20):
+            if br_ctrl.get_policy_engine(policyEngineId=engine_id)["status"] == "ACTIVE":
+                break
+            time.sleep(3)
+    except br_ctrl.exceptions.ConflictException:
+        # Engine already exists.  Try config.py first (fastest), then list.
+        existing_id = getattr(cfg, "GATEWAY_ENGINE_ID", "")
+        if existing_id:
+            engine_id = existing_id
+            ge = br_ctrl.get_policy_engine(policyEngineId=engine_id)
+            engine_arn = ge["policyEngineArn"]
+        else:
+            # Fall back to list (may be empty due to API quirk; best effort).
+            items = br_ctrl.list_policy_engines().get("items", [])
+            match = [e for e in items if e["name"] == "InsideTheLinesEngine"]
+            if not match:
+                raise RuntimeError(
+                    "PolicyEngine already exists but could not be found via list.\n"
+                    "Set GATEWAY_ENGINE_ID in config.py and re-run."
+                ) from None
+            engine_id = match[0]["policyEngineId"]
+            engine_arn = match[0]["policyEngineArn"]
+        print(f"  policy engine exists: {engine_id}")
 
-    # c. Gateway -- MCP protocol, no custom authoriser.
-    #    authorizerType="NONE" means any caller with the right IAM perms can invoke.
-    #    Cedar policies handle the fine-grained tool-level control.
-    gw = br_ctrl.create_gateway(
-        name=cfg.GATEWAY_NAME, roleArn=ROLE_ARN, protocolType="MCP", authorizerType="NONE"
-    )
-    gateway_id = gw["gatewayId"]
-    gateway_url = gw["gatewayUrl"]
-    gateway_arn = f"arn:aws:bedrock-agentcore:{cfg.REGION}:{cfg.ACCOUNT_ID}:gateway/{gateway_id}"
-    print(f"  gateway: {gateway_id}")
-    for _ in range(20):
-        if br_ctrl.get_gateway(gatewayIdentifier=gateway_id)["status"] == "READY":
-            break
-        time.sleep(5)
-
-    # d. Cedar policies -- created after the gateway exists so the real gateway
-    #    ARN can be embedded in the policy resource principal.
-    #    We use a short timestamp suffix to avoid "already exists" errors if
-    #    this script is run again without a full teardown.
-    ts = str(int(time.time()))[-6:]
-
-    # PermitAll: baseline allow for all principals, actions, and resources.
-    permit_cedar = f'permit(principal, action, resource == AgentCore::Gateway::"{gateway_arn}");'
-
-    # ForbidWeb: deny the web_fetch tool call specifically.
-    # toolName in the Cedar context is the tool name WITHOUT the target prefix --
-    # i.e., "web_fetch", not "web-tools___web_fetch".
-    forbid_cedar = (
-        f'forbid(principal, action == AgentCore::Action::"InvokeTool", '
-        f'resource == AgentCore::Gateway::"{gateway_arn}") '
-        f'when {{ context.toolName == "web_fetch" }};'
-    )
-
-    for name, stmt in [(f"PermitAll{ts}", permit_cedar), (f"ForbidWeb{ts}", forbid_cedar)]:
-        br_ctrl.create_policy(
-            name=name,
-            policyEngineId=engine_id,
-            definition={"cedar": {"statement": stmt}},
-            # IGNORE_ALL_FINDINGS: skip Cedar schema validation.
-            # Use WARN or ERROR in production for stricter policy checking.
-            validationMode="IGNORE_ALL_FINDINGS",
+    # c. Gateway -- get-or-create by name.
+    existing_gws = [
+        g for g in br_ctrl.list_gateways().get("items", []) if g["name"] == cfg.GATEWAY_NAME
+    ]
+    if existing_gws:
+        gateway_id = existing_gws[0]["gatewayId"]
+        gw_detail = br_ctrl.get_gateway(gatewayIdentifier=gateway_id)
+        gateway_url = gw_detail["gatewayUrl"]
+        print(f"  gateway exists: {gateway_id}")
+    else:
+        gw = br_ctrl.create_gateway(
+            name=cfg.GATEWAY_NAME, roleArn=ROLE_ARN, protocolType="MCP", authorizerType="NONE"
         )
-        print(f"  policy: {name}")
+        gateway_id = gw["gatewayId"]
+        gateway_url = gw["gatewayUrl"]
+        print(f"  gateway: {gateway_id}")
+        for _ in range(20):
+            if br_ctrl.get_gateway(gatewayIdentifier=gateway_id)["status"] == "READY":
+                break
+            time.sleep(5)
 
-    # e. Attach the policy engine to the gateway in ENFORCE mode.
-    #    ENFORCE means Cedar denials block the call.  MONITOR would log
-    #    without blocking (useful for testing new policies).
-    #    update_gateway() requires ALL original create_gateway() fields --
-    #    it replaces the whole resource, not just the policyEngineConfiguration.
-    br_ctrl.update_gateway(
-        gatewayIdentifier=gateway_id,
-        name=cfg.GATEWAY_NAME,
-        roleArn=ROLE_ARN,
-        authorizerType="NONE",
-        policyEngineConfiguration={"arn": engine_arn, "mode": "ENFORCE"},
+    gateway_arn = f"arn:aws:bedrock-agentcore:{cfg.REGION}:{cfg.ACCOUNT_ID}:gateway/{gateway_id}"
+
+    # d. Cedar policies -- only create if the gateway doesn't already have this
+    #    policy engine attached in ENFORCE mode.  If it does, policies are live.
+    #    NOTE: list_policies() returns empty even when policies exist (API quirk
+    #    as of 2026-05-21), so we cannot use it to detect existing policies.
+    #    Instead we use the gateway attachment as the reliable sentinel.
+    current_pec_check = br_ctrl.get_gateway(gatewayIdentifier=gateway_id).get(
+        "policyEngineConfiguration"
     )
-    for _ in range(20):
-        if br_ctrl.get_gateway(gatewayIdentifier=gateway_id)["status"] == "READY":
-            break
-        time.sleep(5)
-    print("  gateway READY with Cedar policy engine in ENFORCE mode")
+    engine_already_attached = (
+        current_pec_check
+        and current_pec_check.get("arn") == engine_arn
+        and current_pec_check.get("mode") == "ENFORCE"
+    )
+    if engine_already_attached:
+        print("  policies exist (engine already attached to gateway in ENFORCE mode)")
+    else:
+        # Use a timestamp suffix to guarantee unique policy names within the engine.
+        ts = str(int(time.time()))[-6:]
+
+        # PermitAll: baseline allow for all principals, actions, and resources.
+        permit_cedar = (
+            f'permit(principal, action, resource == AgentCore::Gateway::"{gateway_arn}");'
+        )
+        # ForbidWeb: deny the web_fetch tool call.
+        # toolName in the Cedar context is the short name WITHOUT the target prefix.
+        forbid_cedar = (
+            f'forbid(principal, action == AgentCore::Action::"InvokeTool", '
+            f'resource == AgentCore::Gateway::"{gateway_arn}") '
+            f'when {{ context.toolName == "web_fetch" }};'
+        )
+        for name, stmt in [(f"PermitAll{ts}", permit_cedar), (f"ForbidWeb{ts}", forbid_cedar)]:
+            br_ctrl.create_policy(
+                name=name,
+                policyEngineId=engine_id,
+                definition={"cedar": {"statement": stmt}},
+                # IGNORE_ALL_FINDINGS: skip Cedar schema validation.
+                # Use FAIL_ON_ANY_FINDINGS in production for stricter checks.
+                validationMode="IGNORE_ALL_FINDINGS",
+            )
+            print(f"  policy: {name}")
+
+    # e. Attach the policy engine to the gateway in ENFORCE mode -- only if not
+    #    already attached.  get_gateway() returns policyEngineConfiguration if set.
+    current_pec = br_ctrl.get_gateway(gatewayIdentifier=gateway_id).get("policyEngineConfiguration")
+    if current_pec and current_pec.get("arn") == engine_arn:
+        print("  policy engine already attached to gateway")
+    else:
+        # update_gateway() is a full replacement -- all original create fields required.
+        # ENFORCE means Cedar denials block the call; MONITOR would only log them.
+        br_ctrl.update_gateway(
+            gatewayIdentifier=gateway_id,
+            name=cfg.GATEWAY_NAME,
+            roleArn=ROLE_ARN,
+            authorizerType="NONE",
+            policyEngineConfiguration={"arn": engine_arn, "mode": "ENFORCE"},
+        )
+        for _ in range(20):
+            if br_ctrl.get_gateway(gatewayIdentifier=gateway_id)["status"] == "READY":
+                break
+            time.sleep(5)
+        print("  gateway READY with Cedar policy engine in ENFORCE mode")
 
     return {"gateway_id": gateway_id, "gateway_url": gateway_url, "engine_id": engine_id}
 
@@ -561,7 +644,25 @@ if __name__ == "__main__":
     kb_id, ds_id = create_kb(role_arn, index_arn)
 
     print("4/6  ingestion")
-    ingest(kb_id, ds_id)
+    # Skip ingestion if a completed job with indexed documents already exists.
+    # This avoids re-embedding the entire corpus on every re-run (costs ~$0.15).
+    # If you add new papers to S3, re-run teardown.py then build_kb.py to reindex.
+    completed = [
+        j
+        for j in agent.list_ingestion_jobs(knowledgeBaseId=kb_id, dataSourceId=ds_id).get(
+            "ingestionJobSummaries", []
+        )
+        if j.get("status") == "COMPLETE"
+        and j.get("statistics", {}).get("numberOfNewDocumentsIndexed", 0) > 0
+    ]
+    if completed:
+        s = completed[0].get("statistics", {})
+        print(
+            f"  ingestion already complete: "
+            f"{s.get('numberOfNewDocumentsIndexed')} documents indexed -- skipping"
+        )
+    else:
+        ingest(kb_id, ds_id)
     estimate_ingestion_cost()
 
     print("5/6  guardrail")
