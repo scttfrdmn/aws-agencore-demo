@@ -1,0 +1,1077 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Inside the Lines — PCSK9</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Atkinson+Hyperlegible+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet" />
+  <!-- marked.js for Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #1c1f2b;
+      --surface: #252836;
+      --border:  #363a52;
+      --text:    #d4d8e8;
+      --muted:   #7880a0;
+      --accent:  #7b96ff;
+      --green:   #52c48e;
+      --amber:   #f5a623;
+      --red:     #e06060;
+      --code-bg: #191c28;
+      --user-bg: #2a2f4a;
+      font-size: 18px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Atkinson Hyperlegible", "Inter", "Segoe UI", system-ui, sans-serif;
+      line-height: 1.6;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* scrollbars */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+    /* ── outer grid ───────────────────────────────────────────── */
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 272px;
+      grid-template-rows: auto 1fr;
+      grid-template-areas: "header sidebar" "main sidebar";
+      height: 100vh;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 1.25rem;
+      gap: 0 1.75rem;
+    }
+
+    /* ── header ───────────────────────────────────────────────── */
+    header {
+      grid-area: header;
+      padding: 1.1rem 0 0.9rem;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 1.65rem; font-weight: 700; letter-spacing: -0.02em; color: var(--text); }
+    header .subtitle { color: var(--muted); font-size: 0.83rem; margin-top: 0.1rem; }
+
+    /* ── sidebar ──────────────────────────────────────────────── */
+    .sidebar {
+      grid-area: sidebar;
+      overflow-y: auto;
+      padding: 1rem 0 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    /* sticky so sidebar scrolls independently of content */
+    .sidebar-inner {
+      position: sticky;
+      top: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+    }
+    .panel-title {
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.12em;
+      color: var(--muted); margin-bottom: 0.6rem; font-weight: 700;
+    }
+
+    /* cost meter */
+    .meter-total {
+      font-size: 2rem; font-weight: 800; letter-spacing: -0.03em;
+      color: var(--green); font-variant-numeric: tabular-nums; line-height: 1;
+    }
+    .meter-total .dollar { font-size: 2rem; }
+    .meter-status { margin-top: 0.4rem; font-size: 0.78rem; color: var(--muted); }
+
+    /* KB status badge */
+    .kb-status-badge {
+      display: inline-flex; align-items: center; gap: 0.35rem;
+      font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem;
+      border-radius: 20px; margin-bottom: 0.75rem;
+    }
+    .kb-status-badge.checking { color: var(--muted); background: transparent; }
+    .kb-status-badge.ready    { color: var(--green); background: rgba(82,196,142,.12); border: 1px solid rgba(82,196,142,.3); }
+    .kb-status-badge.building { color: var(--amber); background: rgba(245,166,35,.1); border: 1px solid rgba(245,166,35,.3); }
+    .kb-status-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .kb-status-badge.building .dot { animation: pulse 1s ease-in-out infinite; }
+
+    /* KB cost rows */
+    .kb-row {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      font-size: 0.8rem; padding: 0.35rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .kb-row:last-child { border-bottom: none; }
+    .kb-row .lbl { color: var(--muted); line-height: 1.4; }
+    .kb-row .lbl strong { display: block; color: var(--text); font-weight: 600; font-size: 0.82rem; }
+    .kb-row .lbl small { font-size: 0.68rem; opacity: 0.8; }
+    .kb-row .val { font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; text-align: right; white-space: nowrap; margin-left: 0.5rem; }
+
+    /* ── main chat column ─────────────────────────────────────── */
+    .main-col {
+      grid-area: main;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow-y: auto;
+      scroll-behavior: smooth;
+      padding: 0.75rem 0 1rem;
+      gap: 0.5rem;
+    }
+
+    /* ── ingest card ──────────────────────────────────────────── */
+    .ingest-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1.1rem 1.25rem; flex-shrink: 0;
+      animation: fadeSlideIn 0.9s ease;
+    }
+    .ingest-heading {
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.12em;
+      color: var(--muted); margin-bottom: 0.75rem;
+    }
+    .ingest-count {
+      font-size: 1.9rem; font-weight: 800; font-variant-numeric: tabular-nums;
+      color: var(--text); line-height: 1.1; margin-bottom: 0.2rem;
+    }
+    .ingest-count .denom { font-size: 0.85rem; font-weight: 400; color: var(--muted); }
+    .ingest-sub { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.75rem; }
+    .progress-track { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+    .progress-fill {
+      height: 100%; background: var(--accent); border-radius: 3px;
+      transition: width 0.6s ease; min-width: 5px;
+    }
+
+    /* ── chat history ─────────────────────────────────────────── */
+    .chat-history {
+      padding: 0.25rem 0;
+      display: flex; flex-direction: column; gap: 1.25rem;
+    }
+
+    /* ── animations ───────────────────────────────────────────── */
+    @keyframes fadeSlideIn {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+    @keyframes pulse {
+      0%,100% { opacity: 1; }
+      50%      { opacity: 0.3; }
+    }
+
+    /* Elements fade in from above, gently, without overshoot */
+    .msg-pair     { animation: fadeSlideIn 0.9s ease; display: flex; flex-direction: column; gap: 0.5rem; }
+    .phase-line   { animation: fadeSlideIn 0.7s ease; }
+    .model-row    { animation: fadeSlideIn 0.7s ease; }
+    .answer-card  { animation: fadeSlideIn 0.9s ease; }
+    .code-block   { animation: fadeSlideIn 0.9s ease; }
+    .chart-wrap   { animation: fadeSlideIn 0.9s ease; }
+    .receipt-card { animation: fadeSlideIn 1.0s ease; }
+
+    /* ── message pair ─────────────────────────────────────────── */
+    .user-bubble {
+      align-self: flex-end;
+      max-width: 74%;
+      background: var(--user-bg);
+      border: 1px solid #323768;
+      border-radius: 14px 14px 4px 14px;
+      padding: 0.7rem 1rem;
+      font-size: 0.97rem; font-weight: 500; line-height: 1.5;
+    }
+    .user-bubble .q-badge {
+      font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.1em;
+      color: var(--accent); font-weight: 700; margin-bottom: 0.2rem;
+    }
+    .assistant-bubble { align-self: flex-start; width: 100%; }
+
+    .route-tag {
+      display: inline-flex; align-items: center; gap: 0.35rem;
+      font-size: 0.7rem; color: var(--muted);
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 20px; padding: 0.18rem 0.65rem;
+      margin-bottom: 0.45rem;
+      animation: fadeSlideIn 0.7s ease;
+    }
+    .route-tag .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+
+    /* ── phase lines ──────────────────────────────────────────── */
+    .phase-line {
+      color: var(--muted); font-size: 0.82rem;
+      padding: 0.12rem 0 0.12rem 0.4rem; margin-bottom: 0.15rem;
+    }
+    .phase-line::before { content: "▸ "; color: var(--accent); }
+
+    /* ── model row ────────────────────────────────────────────── */
+    .model-row {
+      display: flex; align-items: center; gap: 0.6rem;
+      padding: 0.5rem 0.85rem; border: 1px solid var(--border);
+      border-radius: 6px; margin-bottom: 0.35rem;
+      background: var(--surface); transition: border-color 0.2s; font-size: 0.88rem;
+    }
+    .model-row.running { border-color: var(--amber); }
+    .model-row.done    { border-color: var(--green); }
+    .model-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      flex-shrink: 0; background: var(--border);
+    }
+    .model-row.running .model-dot { background: var(--amber); animation: pulse 1s ease-in-out infinite; }
+    .model-row.done    .model-dot { background: var(--green); }
+    .model-label { font-weight: 600; flex: 1; }
+    .model-why   { font-size: 0.7rem; color: var(--muted); font-style: italic; }
+    .model-meta  { font-size: 0.75rem; color: var(--muted); text-align: right; display: flex; align-items: center; gap: 0.5rem; }
+    .model-meta .cost { color: var(--green); font-weight: 600; }
+    .model-timer { font-size: 0.75rem; color: var(--amber); font-variant-numeric: tabular-nums; min-width: 3.2ch; }
+
+    /* ── code block ───────────────────────────────────────────── */
+    .code-block {
+      background: var(--code-bg); border: 1px solid var(--border);
+      border-radius: 6px; margin: 0.5rem 0; overflow: hidden;
+    }
+    .code-header {
+      padding: 0.3rem 0.85rem; background: #222638;
+      font-size: 0.68rem; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.1em;
+      border-bottom: 1px solid var(--border);
+    }
+    .code-block pre {
+      padding: 0.85rem;
+      font-family: "Atkinson Hyperlegible Mono", "Menlo", monospace;
+      font-size: 0.76rem; line-height: 1.5; overflow-x: auto;
+      white-space: pre; color: #c5ceef; max-height: 260px; overflow-y: auto;
+    }
+
+    /* ── chart ────────────────────────────────────────────────── */
+    .chart-wrap {
+      margin: 0.5rem 0; border: 1px solid var(--border);
+      border-radius: 8px; overflow: hidden; background: #fff;
+    }
+    .chart-wrap img { display: block; width: 100%; }
+
+    /* ── answer card ──────────────────────────────────────────── */
+    .answer-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; margin: 0.5rem 0; overflow: hidden;
+    }
+    .answer-title {
+      padding: 0.45rem 1rem; background: #222638;
+      font-size: 0.68rem; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.1em;
+      border-bottom: 1px solid var(--border);
+    }
+    /* Markdown-rendered answer */
+    .answer-md {
+      padding: 0.85rem 1rem; font-size: 0.92rem; line-height: 1.7;
+    }
+    .answer-md h1,.answer-md h2,.answer-md h3 { color: var(--text); margin: 0.9em 0 0.4em; font-weight: 700; }
+    .answer-md h1 { font-size: 1.1rem; }
+    .answer-md h2 { font-size: 1rem; }
+    .answer-md h3 { font-size: 0.94rem; }
+    .answer-md p  { margin-bottom: 0.65em; }
+    .answer-md ul,.answer-md ol { padding-left: 1.4em; margin-bottom: 0.65em; }
+    .answer-md li { margin-bottom: 0.2em; }
+    .answer-md a  { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .answer-md a:hover { opacity: 0.8; }
+    .answer-md strong { color: var(--text); font-weight: 700; }
+    .answer-md code   { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; font-size: 0.88em; font-family: "Atkinson Hyperlegible Mono", "Menlo", monospace; }
+    .answer-md blockquote { border-left: 3px solid var(--border); padding-left: 0.75em; color: var(--muted); margin: 0.5em 0; }
+    .answer-md hr { border: none; border-top: 1px solid var(--border); margin: 0.75em 0; }
+    .answer-md table { border-collapse: collapse; width: 100%; font-size: 0.85rem; margin-bottom: 0.65em; }
+    .answer-md th,.answer-md td { border: 1px solid var(--border); padding: 0.3em 0.6em; text-align: left; }
+    .answer-md th { background: #222638; color: var(--muted); font-weight: 600; }
+
+    /* ── receipt ──────────────────────────────────────────────── */
+    .receipt-card {
+      background: var(--surface); border: 1px solid var(--green);
+      border-radius: 10px; overflow: hidden; margin-top: 0.75rem;
+    }
+    .receipt-card h2 {
+      padding: 0.55rem 1.1rem; background: #1e3028;
+      font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em;
+      color: var(--green); border-bottom: 1px solid var(--border);
+    }
+    .receipt-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .receipt-table th,.receipt-table td {
+      padding: 0.42rem 1.1rem; text-align: left; border-bottom: 1px solid var(--border);
+    }
+    .receipt-table th {
+      color: var(--muted); font-weight: 600; font-size: 0.7rem;
+      text-transform: uppercase; letter-spacing: 0.08em;
+    }
+    .receipt-table td:last-child {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-family: "Atkinson Hyperlegible Mono", "Menlo", monospace;
+      font-size: 0.78rem;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+
+    /* ── per-message mini receipt ─────────────────────────────── */
+    .msg-receipt {
+      margin-top: 0.5rem;
+      border-top: 1px solid var(--border);
+      padding-top: 0.4rem;
+      display: flex; flex-direction: column; gap: 0.15rem;
+    }
+    .msg-receipt-row {
+      display: flex; align-items: baseline; gap: 0.5rem;
+      font-size: 0.75rem; color: var(--muted);
+    }
+    .mr-label { font-weight: 600; color: var(--text); min-width: 9rem; }
+    .mr-basis { flex: 1; font-size: 0.7rem; }
+    .mr-cost  { font-family: "Atkinson Hyperlegible Mono","Menlo",monospace; font-size: 0.75rem; color: var(--text); white-space: nowrap; }
+    .msg-receipt-total {
+      display: flex; justify-content: space-between;
+      font-size: 0.78rem; font-weight: 700; color: var(--green);
+      padding-top: 0.25rem; border-top: 1px solid var(--border); margin-top: 0.15rem;
+      font-family: "Atkinson Hyperlegible Mono","Menlo",monospace;
+    }
+    .receipt-total {
+      padding: 0.55rem 1.1rem; display: flex;
+      justify-content: space-between; align-items: center;
+    }
+    .receipt-total .lbl { color: var(--muted); font-size: 0.82rem; font-weight: 600; }
+    .receipt-total .amt { color: var(--green); font-size: 1.3rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+
+    /* ── guardrail badge ──────────────────────────────────────── */
+    .guardrail-badge {
+      background: rgba(245,166,35,.08); border: 1px solid rgba(245,166,35,.3);
+      border-radius: 8px; padding: 0.5rem 0.85rem; margin-bottom: 0.4rem;
+      font-size: 0.78rem; animation: fadeSlideIn 0.7s ease;
+    }
+    .guardrail-badge .gb-icon { margin-right: 0.35rem; }
+
+    /* Cedar policy denial badge (Q4 gateway demo) */
+    .policy-badge {
+      background: rgba(224,96,96,.08); border: 1px solid rgba(224,96,96,.35);
+      border-radius: 8px; padding: 0.5rem 0.85rem; margin-bottom: 0.4rem;
+      font-size: 0.78rem; animation: fadeSlideIn 0.7s ease; color: var(--red);
+    }
+    .policy-badge .pb-title { font-weight: 700; margin-bottom: 0.25rem; }
+    .policy-badge .pb-detail { font-size: 0.72rem; color: var(--muted); margin-top: 0.2rem; }
+    .gb-rows { margin-top: 0.35rem; display: flex; flex-direction: column; gap: 0.2rem; }
+    .gb-row { color: var(--muted); font-size: 0.72rem; }
+    .gb-row a { color: var(--accent); text-decoration: underline; }
+    .gb-row code { font-family: "Atkinson Hyperlegible Mono", monospace; }
+    .gb-blocked  { color: var(--red); font-family: "Atkinson Hyperlegible Mono", monospace; font-weight: 700; }
+    .blocked-ref { color: var(--red); font-family: "Atkinson Hyperlegible Mono", monospace; font-weight: 700;
+                   background: rgba(224,96,96,.12); border-radius: 3px; padding: 0 3px; }
+
+    /* ── thinking dots ────────────────────────────────────────── */
+    .thinking-dot {
+      display: flex; gap: 5px; align-items: center;
+      padding: 0.5rem 0.25rem;
+    }
+    .thinking-dot span {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+      animation: thinkBounce 1.2s ease-in-out infinite;
+    }
+    .thinking-dot span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dot span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes thinkBounce {
+      0%,60%,100% { transform: translateY(0);    opacity: 0.4; }
+      30%          { transform: translateY(-7px); opacity: 1;   }
+    }
+
+    /* ── chips ────────────────────────────────────────────────── */
+    .suggestions { display: flex; gap: 0.45rem; flex-wrap: wrap; flex-shrink: 0; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 0.35rem;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 20px; padding: 0.3rem 0.8rem;
+      font-size: 0.75rem; cursor: pointer; color: var(--text);
+      transition: border-color 0.15s, opacity 0.2s; white-space: nowrap;
+    }
+    .chip:hover:not(.fired):not(.locked) { border-color: var(--accent); }
+    .chip.fired  { opacity: 0.38; cursor: default; color: var(--muted); }
+    .chip.locked { opacity: 0.28; cursor: not-allowed; }
+    .chip.fired .cdot  { background: var(--green); }
+    .chip.locked .cdot { background: var(--border); }
+    .cdot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+    .cnum { color: var(--accent); font-weight: 700; }
+    .chip.fired  .cnum { color: var(--green); }
+    .chip.locked .cnum { color: var(--muted); }
+
+    /* ── input bar ────────────────────────────────────────────── */
+    .input-bar {
+      display: flex; align-items: flex-end; gap: 0.55rem;
+      background: var(--surface); border: 1.5px solid var(--border);
+      border-radius: 12px; padding: 0.6rem 0.6rem 0.6rem 1rem;
+      flex-shrink: 0; transition: border-color 0.15s;
+    }
+    .input-bar:focus-within { border-color: var(--accent); }
+    .input-bar textarea {
+      flex: 1; background: none; border: none; outline: none; resize: none;
+      color: var(--text); font-family: inherit; font-size: 0.97rem; line-height: 1.5;
+      min-height: 1.5em; max-height: 8em; overflow-y: auto;
+    }
+    .input-bar textarea::placeholder { color: var(--muted); }
+    .send-btn {
+      width: 34px; height: 34px; border-radius: 8px;
+      background: var(--accent); border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 0.95rem; flex-shrink: 0;
+      transition: opacity 0.15s; align-self: flex-end;
+    }
+    .send-btn:disabled { opacity: 0.32; cursor: default; }
+
+    /* ── done / error ─────────────────────────────────────────── */
+    .done-banner {
+      text-align: center; padding: 1.25rem; color: var(--green);
+      font-size: 0.97rem; font-weight: 700; letter-spacing: 0.05em;
+      animation: fadeSlideIn 0.3s ease;
+    }
+    .error-msg {
+      color: var(--red); padding: 0.7rem 1rem; background: #2e1919;
+      border: 1px solid var(--red); border-radius: 6px;
+      margin-bottom: 0.5rem; font-size: 0.88rem;
+    }
+  </style>
+</head>
+<body>
+<div class="layout" x-data="demo()">
+
+  <header>
+    <h1>Inside the Lines — PCSK9</h1>
+    <p class="subtitle">Biomedical-research agent · AWS Bedrock · AgentCore Code Interpreter</p>
+  </header>
+
+  <!-- sidebar: running cost + KB info -->
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+
+      <!-- cost meter -->
+      <div class="panel">
+        <div class="panel-title">Running cost</div>
+        <div class="meter-total">
+          <span class="dollar">$</span><span x-text="total.toFixed(6)">0.000000</span>
+        </div>
+        <div class="meter-status" x-text="statusLine"></div>
+      </div>
+
+      <!-- KB panel -->
+      <div class="panel">
+        <div class="panel-title">Knowledge base</div>
+
+        <!-- Status badge — persists once set -->
+        <div class="kb-status-badge"
+             :class="kbStatusClass"
+             x-show="kbStatusLabel">
+          <span class="dot"></span>
+          <span x-text="kbStatusLabel"></span>
+        </div>
+
+        <!-- Cost + size rows (shown once we have data) -->
+        <template x-if="setupCost">
+          <div>
+            <div class="kb-row">
+              <span class="lbl">
+                <strong>Ingestion</strong>
+                <small x-text="setupCost.corpus_files ? setupCost.corpus_files.toLocaleString() + ' papers · ' + setupCost.corpus_size_mb + ' MB' : 'one-time · corpus size'"></small>
+              </span>
+              <span class="val" x-text="'$' + (setupCost.ingestion_usd ?? 0).toFixed(4)"></span>
+            </div>
+            <div class="kb-row">
+              <span class="lbl">
+                <strong>S3 Vectors</strong>
+                <small x-text="setupCost.vector_count ? setupCost.vector_count.toLocaleString() + ' vectors · ' + setupCost.vector_size_mb + ' MB' : 'per month'"></small>
+              </span>
+              <span class="val" x-text="'$' + (setupCost.storage_usd_per_month ?? 0).toFixed(4) + '/mo'"></span>
+            </div>
+            <div class="kb-row">
+              <span class="lbl">
+                <strong>S3 corpus</strong>
+                <small x-text="setupCost.corpus_files ? setupCost.corpus_files.toLocaleString() + ' files · ' + setupCost.corpus_size_mb + ' MB' : 'per month'"></small>
+              </span>
+              <span class="val" x-text="'$' + (setupCost.corpus_storage_usd_per_month ?? 0).toFixed(4) + '/mo'"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+
+    </div>
+  </aside>
+
+  <!-- main chat column -->
+  <div class="main-col">
+
+    <div class="error-msg" x-show="error" x-text="error"></div>
+
+    <!-- ingest card: shown when KB is being built -->
+    <div class="ingest-card" x-show="ingestStarted">
+      <div class="ingest-heading">Building Knowledge Base · S3 Vectors · Titan Embed v2</div>
+      <div class="ingest-count">
+        <span x-text="ingestIndexed.toLocaleString()"></span>
+        <span class="denom"> of ~<span x-text="ingestTotal.toLocaleString()"></span> papers</span>
+      </div>
+      <div class="ingest-sub">
+        <span x-show="!ingestDone">Chunking, embedding, and indexing…</span>
+        <span x-show="ingestDone" style="color: var(--green);">✓ Knowledge base ready</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill"
+             :style="'width:' + Math.max(1, Math.round(ingestIndexed / ingestTotal * 100)) + '%'">
+        </div>
+      </div>
+    </div>
+
+    <!-- chat history: grows downward, pushing chips+input below it -->
+    <div class="chat-history">
+      <template x-for="msg in messages" :key="msg.id">
+        <div class="msg-pair">
+
+          <!-- user bubble -->
+          <div class="user-bubble">
+            <div class="q-badge" x-show="msg.cannedN">
+              Question <span x-text="msg.cannedN"></span>
+            </div>
+            <div x-text="msg.text"></div>
+          </div>
+
+          <!-- assistant bubble -->
+          <div class="assistant-bubble">
+
+            <!-- thinking placeholder: shown immediately, disappears once real content arrives -->
+            <div class="thinking-dot" x-show="!msg.phases.length && !msg.models.length && !msg.answer && !msg.routeLabel">
+              <span></span><span></span><span></span>
+            </div>
+
+            <div class="route-tag" x-show="msg.routeLabel">
+              <span class="dot"></span>
+              <span x-text="msg.routeLabel"></span>
+            </div>
+
+            <div class="guardrail-badge" x-show="msg.guardrailActions && msg.guardrailActions.length">
+              <span class="gb-icon">🔒</span>
+              <span x-text="'Bedrock Guardrail: ' + msg.guardrailActions.length + ' link' + (msg.guardrailActions.length !== 1 ? 's' : '') + ' intercepted'"></span>
+              <div class="gb-rows">
+                <template x-for="(a, i) in msg.guardrailActions" :key="i">
+                  <div class="gb-row">
+                    <template x-if="a.local">
+                      <span>↺ <a :href="'/corpus/' + a.local" target="_blank" x-text="a.local"></a> — redirected to local corpus</span>
+                    </template>
+                    <template x-if="!a.local">
+                      <span>🚫 <span class="gb-blocked" x-text="a.original.match(/PMC\d+/)?.[0] ?? a.original.slice(0,40)"></span> — BLOCKED · PMC article not in local corpus</span>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- Cedar Gateway policy denial badge -->
+            <div class="policy-badge" x-show="msg.policyDenial">
+              <div class="pb-title">🚫 Bedrock Cedar Policy — tool call denied</div>
+              <div>Tool: <strong x-text="msg.policyDenial?.tool"></strong></div>
+              <div class="pb-detail" x-text="msg.policyDenial?.reason"></div>
+            </div>
+
+            <template x-for="(ph, i) in msg.phases" :key="i">
+              <div class="phase-line" x-text="ph"></div>
+            </template>
+
+            <template x-for="m in msg.models" :key="m.key">
+              <div class="model-row" :class="m.state">
+                <div class="model-dot"></div>
+                <div class="model-label">
+                  <span x-text="m.label"></span>
+                  <span class="model-why" x-show="m.why" x-text="' — ' + m.why"></span>
+                </div>
+                <div class="model-meta">
+                  <template x-if="m.state === 'running'">
+                    <span class="model-timer" x-text="m.elapsed || '0.0s'"></span>
+                  </template>
+                  <template x-if="m.state === 'done'">
+                    <span>
+                      <span x-text="m.elapsed"></span>
+                      <span style="margin: 0 0.3rem; color: var(--border)">·</span>
+                      <span x-text="m.usage"></span>
+                      <span class="cost" x-text="'  $' + m.cost.toFixed(6)"></span>
+                    </span>
+                  </template>
+                </div>
+              </div>
+            </template>
+
+            <div class="code-block" x-show="msg.code">
+              <div class="code-header">Generated analysis code</div>
+              <pre x-text="msg.code"></pre>
+            </div>
+
+            <div class="chart-wrap" x-show="msg.chart">
+              <img :src="'data:image/png;base64,' + (msg.chart ?? '')" alt="Analysis chart" />
+            </div>
+
+            <div class="answer-card" x-show="msg.answer && msg.answer.text">
+              <div class="answer-title" x-text="msg.answer?.title"></div>
+              <div class="answer-md" x-html="renderMd(msg.answer?.text ?? '')"></div>
+            </div>
+
+            <!-- per-message receipt in the standard green box -->
+            <template x-if="msg.receipt">
+              <div class="receipt-card" style="margin-top:0.5rem">
+                <h2>Receipt</h2>
+                <table class="receipt-table">
+                  <thead>
+                    <tr><th>Step</th><th>Model</th><th>Basis</th><th>Cost</th></tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="(row, i) in msg.receipt.rows ?? []" :key="i">
+                      <tr>
+                        <td x-text="row.step"></td>
+                        <td x-text="row.label"></td>
+                        <td x-text="receiptBasis(row)" style="color:var(--muted);font-size:0.78rem"></td>
+                        <td x-text="'$' + row.usd.toFixed(6)"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+                <div class="receipt-total">
+                  <span class="lbl">Total this question</span>
+                  <span class="amt" x-text="'$' + (msg.receipt.total ?? 0).toFixed(6)"></span>
+                </div>
+              </div>
+            </template>
+
+          </div>
+        </div>
+      </template>
+
+      <!-- done banner only after all three canned questions complete -->
+      <div class="done-banner" x-show="allThreeDone">✓ Run complete</div>
+
+      <!-- total receipt after all three done — accumulates all question rows -->
+      <template x-if="allThreeDone">
+        <div class="receipt-card" style="margin-top:0.5rem">
+          <h2>Total Receipt</h2>
+          <table class="receipt-table">
+            <thead>
+              <tr><th>Step</th><th>Model</th><th>Basis</th><th>Cost</th></tr>
+            </thead>
+            <tbody>
+              <template x-for="msg in messages.filter(m => m.receipt)" :key="msg.id">
+                <template x-for="(row, i) in msg.receipt.rows ?? []" :key="msg.id + '-' + i">
+                  <tr>
+                    <td x-text="row.step"></td>
+                    <td x-text="row.label"></td>
+                    <td x-text="receiptBasis(row)" style="color:var(--muted);font-size:0.78rem"></td>
+                    <td x-text="'$' + row.usd.toFixed(6)"></td>
+                  </tr>
+                </template>
+              </template>
+            </tbody>
+          </table>
+          <div class="receipt-total">
+            <span class="lbl">Grand total</span>
+            <span class="amt" x-text="'$' + total.toFixed(6)"></span>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- chips + input: after history so they sit below it and get pushed down -->
+    <div class="suggestions" x-show="kbReady">
+      <template x-for="c in canned" :key="c.n">
+        <button class="chip"
+                :class="{ fired: c.fired, locked: !prevAnswered(c) && !c.fired }"
+                @click="fireChip(c)"
+                :disabled="c.fired || running || !prevAnswered(c)">
+          <span class="cdot"></span>
+          <span class="cnum" x-text="'Q' + c.n"></span>
+          <span x-text="c.short"></span>
+        </button>
+      </template>
+    </div>
+
+    <div class="input-bar" x-show="kbReady">
+      <textarea
+        x-ref="inputBox"
+        x-model="draft"
+        placeholder="Ask a question…"
+        rows="1"
+        @keydown.enter.prevent="if (!$event.shiftKey) send()"
+        @input="autoGrow($el)"
+      ></textarea>
+      <button class="send-btn" @click="send()" :disabled="!draft.trim() || running">&#x2191;</button>
+    </div>
+
+  </div><!-- end main-col -->
+</div>
+
+<script>
+// Configure marked for safe rendering
+marked.setOptions({ breaks: true, gfm: true });
+
+const MODEL_ROLES = {
+  haiku:  'reads and cites',
+  sonnet: 'writes analysis code / adjudicates',
+  opus:   'independent expert review',
+  nova:   'independent expert review (second family)',
+};
+
+const TELETYPE_CPS = 60;
+const CHIP_SHORTS  = [
+  'Role of PCSK9 in LDL regulation',
+  'Compare trials & chart',
+  'Where does literature disagree?',
+  'Search ClinicalTrials.gov for ongoing trials',
+];
+
+function receiptBasis(row) {
+  if (row.label === 'KB retrieval')     return '1 API query  ·  $0.40/1K queries';
+  if (row.label === 'Code Interpreter') return `wall-clock seconds  ·  $0.0000301/s`;
+  if (row.in_tokens || row.out_tokens)
+    return `${(row.in_tokens||0).toLocaleString()} in  /  ${(row.out_tokens||0).toLocaleString()} out  tokens`;
+  return '';
+}
+
+function renderMd(text) {
+  if (!text) return '';
+  try {
+    let t = text;
+    // Linkify [source: PMCxxxxx] (plain ID) to our local corpus viewer
+    t = t.replace(
+      /\[source:\s*(PMC\d+)\]/gi,
+      (_, id) => `[[${id}]](/corpus/${id})`
+    );
+    // Highlight blocked (not-in-corpus) bare PMC refs: ([PMCxxxxx]) — brackets, no URL
+    // Convert to a red <span> before marked parses so they don't get bracket-mangled
+    t = t.replace(
+      /\(\[(PMC\d+)\]\)(?!\()/g,   // ([PMCxxxxx]) NOT followed by ( — i.e. no URL
+      (_, id) => `(<span class="blocked-ref">${id}</span>)`
+    );
+    return marked.parse(t);
+  } catch (e) { return text; }
+}
+
+function demo() {
+  return {
+    // KB state
+    kbReady:       false,
+    kbStatusLabel: 'Checking…',
+    kbStatusClass: 'checking',
+    ingestStarted: false,
+    ingestDone:    false,
+    ingestIndexed: 0,
+    ingestTotal:   1000,
+
+    // cost meter
+    total:      0,
+    statusLine: 'waiting…',
+    setupCost:  null,
+
+    // chips
+    canned: [],
+
+    // chat
+    messages:     [],
+    receipt:      null,
+    running:      false,
+    error:        null,
+    draft:        '',
+    _msgId:        0,
+    _timerHandle:  null,
+    _doneMsgIds:   new Set(),
+    _userScrolled: false,
+    _baseTotal:    0,    // accumulated total from completed questions
+
+    get allThreeDone() {
+      // "Run complete" fires after all four canned questions are answered
+      return this.canned.length === 4 && this.canned.every(c => c.fired)
+          && this._doneMsgIds.size >= 4;
+    },
+
+    // ── init ───────────────────────────────────────────────────
+    async init() {
+      try {
+        const [sr, qr, cr] = await Promise.all([
+          fetch('/api/kb-status'),
+          fetch('/api/questions'),
+          fetch('/api/kb-costs'),
+        ]);
+        const { ready }     = await sr.json();
+        const { questions } = await qr.json();
+        const costs         = await cr.json();
+
+        this.setupCost = costs;
+        this.canned = questions.map((text, i) => ({
+          n: i + 1, full: text,
+          short: CHIP_SHORTS[i] ?? text.slice(0, 40),
+          fired: false, _timer: null,
+        }));
+
+        this._initScroll();
+
+        if (ready) {
+          this.kbReady      = true;
+          this.kbStatusLabel = '✓ ready';
+          this.kbStatusClass = 'ready';
+        } else {
+          this.kbStatusLabel = 'Building…';
+          this.kbStatusClass = 'building';
+          this.ingestStarted = true;
+          this._startIngest();
+        }
+      } catch (e) {
+        this.error = 'Could not reach server: ' + e.message;
+      }
+    },
+
+    // ── ingest WS ──────────────────────────────────────────────
+    _startIngest() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ingest`);
+      ws.onmessage = (evt) => {
+        try {
+          const ev = JSON.parse(evt.data);
+          if (ev.type === 'ingesting') {
+            this.ingestIndexed = ev.indexed;
+            this.ingestTotal   = ev.total || 1000;
+          } else if (ev.type === 'kb_ready') {
+            this.setupCost     = ev;
+            this.ingestDone    = true;
+            this.kbReady       = true;
+            this.kbStatusLabel = '✓ ready';
+            this.kbStatusClass = 'ready';
+          }
+        } catch (e) { console.error('bad ingest event', e); }
+      };
+      ws.onerror = () => { this.error = 'Ingestion error — check server logs.'; };
+    },
+
+    // ── chip helpers ───────────────────────────────────────────
+    prevAnswered(c) {
+      if (c.n === 1) return true;
+      return this.canned[c.n - 2]?.fired === true;
+    },
+
+    fireChip(c) {
+      if (c.fired || this.running || !this.prevAnswered(c)) return;
+      c._typed = 0;
+      const ms = Math.round(1000 / TELETYPE_CPS);
+      c._timer = setInterval(() => {
+        if (c._typed < c.full.length) {
+          this.draft = c.full.slice(0, ++c._typed);
+          this.autoGrow(this.$refs.inputBox);
+        } else {
+          clearInterval(c._timer); c._timer = null;
+          setTimeout(() => this._fireCanned(c), 350);
+        }
+      }, ms);
+    },
+
+    _fireCanned(c) {
+      if (this.running) return;
+      c.fired = true;
+      const text = this.draft.trim();
+      this.draft = ''; this.autoGrow(this.$refs.inputBox);
+      this._connect(text, c.n, `?q=${c.n}`);
+    },
+
+    // ── free-form send ─────────────────────────────────────────
+    send() {
+      const text = this.draft.trim();
+      if (!text || this.running) return;
+      const match = this.canned.find(c => !c.fired && c.full === text);
+      if (match) {
+        match.fired = true;
+        this.draft = ''; this.autoGrow(this.$refs.inputBox);
+        this._connect(text, match.n, `?q=${match.n}`);
+      } else {
+        this.draft = ''; this.autoGrow(this.$refs.inputBox);
+        this._connect(text, null, `?text=${encodeURIComponent(text)}`);
+      }
+    },
+
+    // ── open WS for a message ──────────────────────────────────
+    _connect(text, cannedN, wsParams) {
+      this.running = true;
+      this.statusLine = 'running…';
+      const msgId = ++this._msgId;
+      this._userScrolled = false;  // new question → resume auto-scroll
+      this.messages.push({
+        id: msgId, text, cannedN, routeLabel: null,
+        phases: [], models: [], code: null, chart: null, answer: null,
+        receipt: null, guardrailActions: [], policyDenial: null,
+      });
+      this._scrollDown();
+
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws${wsParams}`);
+
+      ws.onmessage = (evt) => {
+        try { this._handle(JSON.parse(evt.data), msgId); }
+        catch (e) { console.error('bad event', e, evt.data); }
+        this._scrollDown();
+      };
+      ws.onerror = () => { this.running = false; this.error = 'WebSocket error.'; };
+      ws.onclose = () => { this.running = false; this._stopTimers(); };
+    },
+
+    // ── live timer for running models ──────────────────────────
+    // Each running model row stores its own startedAt timestamp so parallel
+    // models (e.g. Opus + Nova in Q3) each show their own independent elapsed
+    // time.  The interval reads per-row startedAt rather than a shared t0.
+    _startTimers() {
+      if (this._timerHandle) return;
+      this._timerHandle = setInterval(() => {
+        const now = Date.now();
+        this.messages = this.messages.map(msg => {
+          if (!msg.models.some(m => m.state === 'running')) return msg;
+          return { ...msg, models: msg.models.map(m =>
+            m.state !== 'running' ? m
+              : { ...m, elapsed: ((now - (m.startedAt ?? now)) / 1000).toFixed(1) + 's' }
+          )};
+        });
+      }, 100);
+    },
+
+    _stopTimers() {
+      if (this._timerHandle) { clearInterval(this._timerHandle); this._timerHandle = null; }
+      // Re-start if any running rows remain (called after one of several parallel finishes)
+      if (this.messages.some(msg => msg.models.some(m => m.state === 'running'))) {
+        this._startTimers();
+      }
+    },
+
+    // ── event handler (immutable updates for Alpine reactivity) ──
+    _handle(ev, msgId) {
+      const upd = (patch) => {
+        const i = this.messages.findIndex(m => m.id === msgId);
+        if (i >= 0) this.messages[i] = { ...this.messages[i], ...patch };
+      };
+      const cur = () => {
+        const i = this.messages.findIndex(m => m.id === msgId);
+        return i >= 0 ? this.messages[i] : null;
+      };
+
+      switch (ev.type) {
+
+        case 'error':
+          this.error = ev.message; this.running = false; this._stopTimers(); break;
+
+        case 'question': upd({ text: ev.text }); break;
+        case 'route':    upd({ routeLabel: ev.label }); break;
+
+        case 'phase': {
+          const m = cur(); if (m) upd({ phases: [...m.phases, ev.label] });
+          this.statusLine = ev.label; break;
+        }
+        case 'retrieval': {
+          const m = cur();
+          if (m) upd({ phases: [...m.phases, `Retrieved ${ev.count} excerpts from papers`] }); break;
+        }
+
+        case 'model': {
+          const key = ev.tier + ':' + ev.label;
+          const m = cur(); if (!m) break;
+          if (ev.state === 'start') {
+            upd({ models: [...m.models, {
+              key, label: ev.label, why: MODEL_ROLES[ev.tier] ?? '',
+              state: 'running', usage: '', cost: 0, elapsed: '0.0s',
+              startedAt: Date.now(),
+            }]});
+            this.statusLine = ev.label + '…';
+            this._startTimers();
+          } else {
+            // Stop interval, update this row to done, then _stopTimers will
+            // re-start the interval automatically if other rows are still running.
+            clearInterval(this._timerHandle); this._timerHandle = null;
+            upd({ models: m.models.map(r => r.key !== key ? r : {
+              ...r, state: 'done', cost: ev.cost ?? 0,
+              elapsed: ev.elapsed_s != null ? `${ev.elapsed_s}s` : '',
+              usage: `${(ev.usage?.inputTokens ?? 0).toLocaleString()} in / ${(ev.usage?.outputTokens ?? 0).toLocaleString()} out`,
+            })});
+            this._stopTimers();  // re-starts if other rows still running
+          }
+          break;
+        }
+
+        case 'guardrail': {
+          const m = cur(); if (!m) break;
+          upd({ guardrailActions: [...(m.guardrailActions ?? []), ...ev.actions] });
+          break;
+        }
+
+        case 'policy_denied':
+          upd({ policyDenial: { tool: ev.tool, reason: ev.reason } });
+          break;
+
+        case 'answer': upd({ answer: { title: ev.title, text: ev.text } }); break;
+        case 'code':   upd({ code:  ev.text }); break;
+        case 'chart':  upd({ chart: ev.data }); break;
+
+        case 'cost':       this.total = this._baseTotal + ev.total; break;
+        case 'setup_cost': this.setupCost = ev;   break;
+
+        case 'receipt':
+          upd({ receipt: ev });
+          // The receipt total is this question's subtotal; add it to the base
+          // so subsequent questions keep accumulating from here.
+          this._baseTotal += ev.total;
+          this.total = this._baseTotal;
+          this.statusLine = 'complete'; break;
+
+        case 'done':
+          this._doneMsgIds.add(msgId);
+          this.statusLine = this.allThreeDone ? 'done' : 'ready';
+          break;
+      }
+    },
+
+    // ── helpers ────────────────────────────────────────────────
+    _scrollDown() {
+      if (this._userScrolled) return;
+      // Use a double-rAF so layout is fully settled before measuring.
+      // MAX_SAFE_INTEGER clamps to the real bottom regardless of stale scrollHeight.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const el = document.querySelector('.main-col');
+        if (el && !this._userScrolled) {
+          el.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: 'smooth' });
+        }
+      }));
+    },
+
+    _initScroll() {
+      const el = document.querySelector('.main-col');
+      if (!el) return;
+      let lastScrollTop = 0;
+      el.addEventListener('scroll', () => {
+        const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+        // Only flag as user-scrolled if the user scrolled *up* (scrollTop decreased)
+        if (el.scrollTop < lastScrollTop && distFromBottom > 120) {
+          this._userScrolled = true;
+        }
+        // Auto-resume when user scrolls back to bottom
+        if (distFromBottom < 20) {
+          this._userScrolled = false;
+        }
+        lastScrollTop = el.scrollTop;
+      }, { passive: true });
+    },
+
+    autoGrow(el) {
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 144) + 'px';
+    },
+  };
+}
+</script>
+</body>
+</html>
