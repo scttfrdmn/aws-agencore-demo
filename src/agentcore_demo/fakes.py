@@ -1,13 +1,50 @@
 """
 fakes.py  --  FakeBackend and test pricing for the demo.
 
-Lives in the package (not in tests/) so both the app (DEMO_FAKE=1) and the
-test suite can import it from the same place. No AWS deps, no network.
+This module is intentionally part of the main package (not in tests/) so
+it can be used in two different ways:
 
-Environment variables that control fake behaviour:
-  DEMO_FAKE=1           use FakeBackend (required)
-  DEMO_FAKE_READY=0     start with KB not ready (default: ready)
-  DEMO_FAKE_INGEST_DELAY=0.3  seconds between fake progress steps (default: 0)
+  1. By tests (tests/conftest.py, tests/test_agent.py, etc.)
+     The test suite imports FakeBackend and make_fake_backend_and_meter()
+     directly.  No AWS credentials, no config.py, no network calls.
+
+  2. By the web app in fake mode (DEMO_FAKE=1)
+     `make demo-fake` sets DEMO_FAKE=1 and app._build_backend() imports
+     FakeBackend here.  This lets you rehearse the entire UI flow --
+     including the live cost meter and the Cedar policy denial badge --
+     without spending any AWS money.
+
+Environment variables that control FakeBackend behaviour:
+
+  DEMO_FAKE=1
+    Required for the app to use FakeBackend.  Without this the app tries
+    to import config.py and build a real AwsBackend.
+
+  DEMO_FAKE_READY=0
+    Start the fake backend with the KB not ready.  The app will show the
+    ingestion progress view and animate through fake progress steps before
+    revealing the question prompt.  Default: 1 (KB is ready).
+    Example: make demo-fake-ingest
+
+  DEMO_FAKE_INGEST_DELAY=0.3
+    Seconds to sleep between fake ingestion progress steps.  Set this to
+    0.3 (or any positive float) to make the progress bar animate slowly
+    enough to see.  Default: 0 (instant, for tests).
+    Example: make demo-fake-ingest
+
+What is "canned" in the fake:
+
+  retrieve()       -- returns 6 plausible-looking passages per call.
+  converse()       -- returns a tier-labelled placeholder answer, EXCEPT:
+    - for the code-generation system prompt (Q2), returns valid Python
+      that prints a 1×1 PNG as CHART_B64 so the chart path is exercised.
+    - for the routing system prompt, classifies the question by keyword.
+  code_interpreter_run() -- echoes the CHART_B64 line from the code.
+  kb_setup_costs() -- returns FAKE_KB_SETUP_COSTS (realistic-ish numbers).
+  kb_is_ready()    -- controlled by DEMO_FAKE_READY.
+  kb_ingest()      -- animates through _INGEST_STEPS, then sets ready=True.
+  kb_flush()       -- sets ready=False.
+  query_gateway()  -- denies web_fetch (mimics Cedar policy); allows others.
 """
 
 from __future__ import annotations
@@ -19,50 +56,73 @@ from collections.abc import Callable
 
 from agentcore_demo.cost import CostMeter
 
-# Realistic-ish placeholder pricing for deterministic cost assertions.
+# Realistic-ish placeholder pricing for deterministic cost assertions in tests.
+# These are intentionally NOT the real AWS prices -- tests should assert on
+# known values, not on real rates that might change.
 TEST_PRICING: dict[str, tuple[float, float]] = {
-    "haiku": (0.80, 4.00),
+    "haiku": (0.80, 4.00),  # USD per 1M input, per 1M output tokens
     "sonnet": (3.00, 15.00),
     "opus": (15.00, 75.00),
     "nova": (0.80, 3.20),
 }
 
-# Live KB rate used by CostMeter for retrieval pricing.
+# KB retrieval rate used by CostMeter in tests.
 TEST_KB_RATES = {
     "kb_query_usd_per_1k": 0.40,  # $0.40 per 1,000 retrieval queries
 }
 
 # Canned KB setup costs returned by FakeBackend.kb_setup_costs().
+# These are realistic-ish numbers based on a real ~650-paper corpus.
 FAKE_KB_SETUP_COSTS = {
-    "ingestion_usd": 0.10,
-    "storage_usd_per_month": 0.025,
-    "corpus_storage_usd_per_month": 0.0002,
-    "vector_count": 5508,
-    "vector_size_mb": 24.2,
-    "corpus_files": 200,
-    "corpus_size_mb": 9.8,
+    "ingestion_usd": 0.10,  # ~$0.10 to embed 650 papers
+    "storage_usd_per_month": 0.025,  # ~$0.025/month for S3 Vectors
+    "corpus_storage_usd_per_month": 0.0002,  # ~fractions of a cent for S3
+    "vector_count": 5508,  # typical chunk count for 650 papers
+    "vector_size_mb": 24.2,  # 5508 × 4608 bytes ÷ 1024²
+    "corpus_files": 200,  # subset of the full corpus
+    "corpus_size_mb": 9.8,  # typical size in MB
 }
 
-# A valid 1x1 PNG, base64 -- enough to exercise the chart path.
+# A valid 1×1 transparent PNG encoded in base64.
+# This is the smallest valid PNG that matplotlib could produce.
+# It exercises the chart extraction path (agent._extract_chart) without
+# needing to actually run matplotlib in tests.
 _PNG_1x1 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
 )
 
-# Fake ingestion steps: (indexed, total) tuples streamed to progress_cb.
+# Fake ingestion progress steps: (indexed, total) pairs that progress_cb receives.
+# Simulates a job that indexes 1,000 documents in 4 steps.
 _INGEST_STEPS = [(0, 1000), (250, 1000), (500, 1000), (750, 1000), (1000, 1000)]
 
 
 class FakeBackend:
-    """Canned implementation of the Backend protocol -- no AWS, no network."""
+    """Canned implementation of the Backend protocol -- no AWS, no network.
+
+    All public methods record their calls in self.calls so tests can assert
+    on what the agent called without inspecting output.
+    Example:
+        backend, meter = make_fake_backend_and_meter()
+        agent = Agent(backend, meter, emit=lambda e: None)
+        agent.question_1()
+        assert "retrieve:" in backend.calls[0]
+    """
 
     def __init__(self) -> None:
+        # Records every method call as a short string for test assertions.
         self.calls: list[str] = []
-        # KB readiness: controlled by DEMO_FAKE_READY env var (default ready).
+
+        # Controlled by DEMO_FAKE_READY env var.
+        # "1" (default): KB is ready, app skips ingestion and goes to question prompt.
+        # "0": KB is not ready, app shows ingestion progress view.
         self._ready: bool = os.environ.get("DEMO_FAKE_READY", "1") != "0"
-        # Delay between fake ingestion progress steps (0 = instant, for tests).
+
+        # Seconds to sleep between fake ingestion steps.
+        # 0 = instant (for tests); 0.3 = visible animation (for make demo-fake-ingest).
         self._ingest_delay: float = float(os.environ.get("DEMO_FAKE_INGEST_DELAY", "0"))
 
     def retrieve(self, query: str, n: int = 12) -> list[dict]:
+        """Return n plausible-looking passages about PCSK9."""
         self.calls.append(f"retrieve:{query[:20]}")
         return [
             {
@@ -70,18 +130,31 @@ class FakeBackend:
                 "source": f"s3://demo/PMC{1000 + i}.txt",
                 "score": 0.9 - i * 0.01,
             }
-            for i in range(min(n, 6))
+            for i in range(min(n, 6))  # cap at 6 so tests don't get huge prompts
         ]
 
     def converse(
         self, tier: str, system: str, prompt: str, max_tokens: int = 1600
     ) -> tuple[str, dict, list[dict]]:
+        """Return a canned response appropriate to the tier and system prompt.
+
+        Special cases:
+          - Code-generation prompt (Q2): return valid Python that prints a
+            CHART_B64 token so the chart extraction path is exercised.
+          - Routing prompt: classify by keyword so routing tests are deterministic.
+          - Everything else: return a placeholder answer with the tier name.
+        """
         self.calls.append(f"converse:{tier}")
         usage = {"inputTokens": 12_000, "outputTokens": 1_000}
+
+        # Q2: the system prompt mentions "self-contained Python".
+        # Return a minimal script that prints a valid base64 PNG.
         if tier == "sonnet" and "self-contained Python" in system:
             code = f"import io, base64\nprint('CHART_B64:{_PNG_1x1}')"
             return code, usage, []
-        # Routing call: classify the question by scanning for keywords.
+
+        # Routing: the system prompt says "Reply with exactly one word".
+        # Classify by keyword so test inputs produce deterministic routes.
         if "Reply with exactly one word" in system:
             p = prompt.lower()
             if any(k in p for k in ["chart", "compare", "trial", "analys", "quantif", "visuali"]):
@@ -89,40 +162,57 @@ class FakeBackend:
             if any(k in p for k in ["disagree", "controvers", "adverse", "debate", "next"]):
                 return "DEBATE", {"inputTokens": 50, "outputTokens": 1}, []
             return "SYNTHESIS", {"inputTokens": 50, "outputTokens": 1}, []
+
+        # Default: a labelled placeholder for any other call.
         return f"[{tier}] answer to: {prompt[:40]}", usage, []
 
     def code_interpreter_run(self, code: str) -> tuple[str, float]:
-        """Simulate running code: echo the CHART_B64 line the script would print."""
+        """Simulate running code: echo the CHART_B64 line the script would print.
+
+        Extracts the CHART_B64 token from the code string (which was generated
+        by the fake converse() above) and returns it as if the interpreter
+        had actually executed the print statement.
+        """
         self.calls.append("code_interpreter")
         m = re.search(r"CHART_B64:([A-Za-z0-9+/=]+)", code)
         return (f"CHART_B64:{m.group(1)}" if m else "ran ok"), 2.5
 
     def kb_setup_costs(self) -> dict:
-        """Return canned measured KB costs (no AWS)."""
+        """Return canned KB setup costs -- no AWS calls."""
         self.calls.append("kb_setup_costs")
         return dict(FAKE_KB_SETUP_COSTS)
 
     def kb_is_ready(self) -> bool:
+        """Return the current ready state, controlled by DEMO_FAKE_READY."""
         self.calls.append("kb_is_ready")
         return self._ready
 
     def kb_ingest(self, progress_cb: Callable[[int, int], None]) -> dict:
-        """Simulate ingestion with fake progress steps."""
+        """Simulate ingestion by animating through _INGEST_STEPS.
+
+        If DEMO_FAKE_INGEST_DELAY > 0, sleeps between steps so the
+        progress bar animation is visible in the browser.
+        """
         self.calls.append("kb_ingest")
         for indexed, total in _INGEST_STEPS:
             progress_cb(indexed, total)
             if self._ingest_delay > 0:
                 time.sleep(self._ingest_delay)
-        self._ready = True
+        self._ready = True  # mark ready after "ingestion" completes
         return dict(FAKE_KB_SETUP_COSTS)
 
     def kb_flush(self) -> None:
-        """Reset ready state so the next kb_ingest() will run."""
+        """Reset the ready state so the next kb_ingest() will run again."""
         self.calls.append("kb_flush")
         self._ready = False
 
     def query_gateway(self, tool_name: str, arguments: dict) -> dict:
-        """Fake gateway: deny web_fetch (mimics Cedar policy), allow everything else."""
+        """Fake Cedar gateway: deny web_fetch, allow everything else.
+
+        This mimics the real Cedar ForbidWeb policy that denies web_fetch
+        at the AgentCore Gateway level.  The demo relies on this denial to
+        show the "Cedar Policy Denied" badge and the KB fallback.
+        """
         self.calls.append(f"query_gateway:{tool_name}")
         if tool_name == "web_fetch":
             return {
@@ -133,5 +223,9 @@ class FakeBackend:
 
 
 def make_fake_backend_and_meter() -> tuple[FakeBackend, CostMeter]:
-    """Convenience factory: FakeBackend + CostMeter with test pricing + KB rates."""
+    """Convenience factory: FakeBackend + CostMeter with test pricing + KB rates.
+
+    Used by both tests/conftest.py and run.py (DEMO_FAKE=1 path) so the
+    test and fake-app pricing are always in sync.
+    """
     return FakeBackend(), CostMeter(pricing=TEST_PRICING, ci_per_second=0.0, **TEST_KB_RATES)

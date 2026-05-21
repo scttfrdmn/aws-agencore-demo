@@ -1,13 +1,70 @@
 """
-questions.py  --  the three locked demo questions and their system prompts.
+questions.py  --  the locked question texts and their system prompts.
 
-These are rehearsed for the live talk. DO NOT reword them.
-The escalation across the three is the demo: cheap model -> workhorse ->
-the hard call cross-checked by two model families.
+The three (now four) demo questions are rehearsed for the live talk.
+DO NOT reword them.  The exact phrasing has been tested for timing,
+audience clarity, and model response quality.
+
+Why PCSK9?
+  PCSK9 is a well-studied gene with a clear mechanism (LDL regulation),
+  active clinical trials, and genuine scientific controversy (off-target
+  effects of inhibition).  It provides rich, layered questions that each
+  call for a different AI approach -- making it ideal for a four-beat demo.
+
+The four demo beats and their model choices:
+
+  Beat 1 -- "Friction gone"
+    Question: What is the established role of PCSK9 in LDL-cholesterol regulation?
+    Model: Claude Haiku 4.5 (cheapest capable model)
+    Story: A researcher asks a plain background question.  Haiku reads 650 papers,
+           cites sources, and returns in seconds.  The Bedrock Guardrail intercepts
+           the NCBI URLs and the UI shows the "N links intercepted" badge.
+    Why Haiku: The question has a well-established answer.  Haiku is fast,
+               cheap, and accurate enough.  The audience sees high quality
+               at low cost -- a key demo point.
+
+  Beat 2 -- "Real work, faster"
+    Question: Compare the reported LDL-lowering effects across the clinical trials
+              in this corpus, and chart them.
+    Model: Claude Sonnet 4.6 (for code generation) + AgentCore Code Interpreter
+    Story: Sonnet writes Python analysis code; a Bedrock microVM executes it
+           in isolation and returns a chart.  The code runs in the cloud,
+           not on the demo laptop.
+    Why Sonnet: Code generation needs more reasoning than Haiku provides but
+                does not require Opus-level depth.  Sonnet is the right size.
+
+  Beat 3 -- "A second opinion"
+    Question: Where does the literature disagree about the off-target or adverse
+              effects of PCSK9 inhibition, and what should be tested next?
+    Models: Claude Opus 4.7 AND Amazon Nova Pro (parallel) + Claude Sonnet adjudicates
+    Story: The hardest question -- genuine scientific controversy.  Two frontier
+           models from DIFFERENT companies read the same evidence independently.
+           Sonnet then adjudicates: where do they agree, where do they disagree,
+           and which disagreements are the highest-value next experiments.
+    Why Opus: Opus 4.7 is Anthropic's most capable reasoning model -- appropriate
+              for a question that requires careful evidence synthesis.
+    Why Nova Pro: Using a non-Anthropic model provides an independent second
+                  opinion and demonstrates that Bedrock gives you multi-model
+                  access within the same secure boundary.
+    Why Sonnet for adjudication: Fast and accurate enough to compare two
+                  expert reviews.  Opus would be unnecessary for this task.
+
+  Beat 4 -- "Secure by policy"
+    Question: Search ClinicalTrials.gov for ongoing trials testing the experiments
+              Q3 identified as priorities.
+    Model: Claude Haiku 4.5
+    Story: The agent tries to fetch from ClinicalTrials.gov via the AgentCore
+           Gateway.  A Cedar ForbidWeb policy denies the tool call.  The agent
+           detects the denial, shows the "Cedar Policy Denied" badge, and
+           falls back to the knowledge base.
+    Why Haiku: The fallback is a straightforward synthesis task -- no need
+               for a larger model.  The demo point is the Cedar policy, not
+               the model choice.
 """
 
 SUBJECT = "PCSK9"
 
+# The four canned questions -- locked for the live talk.
 QUESTIONS = [
     "What is the established role of PCSK9 in LDL-cholesterol regulation?",
     "Compare the reported LDL-lowering effects across the clinical trials in "
@@ -19,6 +76,11 @@ QUESTIONS = [
 ]
 
 # System prompt for Q1 -- cited synthesis (Claude Haiku).
+# We instruct the model to include full NCBI URLs so the Bedrock Guardrail
+# has something to intercept and anonymise.  The guardrail demo is only
+# visible if models actually produce external URLs.
+# We also hard-code a citation to the FOURIER trial (PMC5481105) as a
+# landmark result the audience will recognise from any cardiology talk.
 SYNTHESIS_SYSTEM = (
     "You are a biomedical research assistant. Answer from the provided passages. "
     "After each claim, append a citation in this exact format: "
@@ -33,6 +95,8 @@ SYNTHESIS_SYSTEM = (
 # System prompt for Q2 -- analysis code generation (Claude Sonnet).
 # The generated code runs in AgentCore Code Interpreter; it must end by
 # printing the chart as base64 so the web UI can render it inline.
+# "Output ONLY the code" reduces the chance of Sonnet wrapping the code
+# in markdown fences (though agent.py strips those anyway).
 CODEGEN_SYSTEM = (
     "You write self-contained Python for data analysis. Use only matplotlib, "
     "numpy, pandas. Extract the trial names and reported LDL-lowering "
@@ -45,7 +109,11 @@ CODEGEN_SYSTEM = (
     "Output ONLY the code -- no prose, no markdown fences."
 )
 
-# System prompt for Q3 -- independent expert reading (Claude Opus AND Nova Pro).
+# System prompt for Q3 -- independent expert review (Claude Opus AND Amazon Nova Pro).
+# Both models receive the SAME system prompt and the SAME passages.
+# The point is that two independent models may notice different things --
+# their disagreements highlight genuinely uncertain areas in the literature.
+# Full NCBI URLs are requested here too so the guardrail is active on Q3.
 REVIEW_SYSTEM = (
     "You are a careful biomedical reviewer. From ONLY these passages, identify "
     "points of genuine disagreement about off-target / adverse effects, and "
@@ -53,14 +121,18 @@ REVIEW_SYSTEM = (
     "URLs, e.g. https://www.ncbi.nlm.nih.gov/pmc/articles/PMCxxxxxxx/."
 )
 
-# System prompt for Q3 -- adjudicating the two independent readings (Sonnet).
+# System prompt for Q3 -- adjudication (Claude Sonnet).
+# Sonnet receives both independent reviews and compares them.
+# "Be concise" keeps the adjudication short enough to fit on the demo slide.
 ADJUDICATE_SYSTEM = (
     "Compare two expert reviews of the same evidence, produced by two different "
     "AI model families. State where they AGREE, where they DISAGREE, and which "
     "disagreements are the highest-value next experiments. Be concise."
 )
 
-# System prompt for Q4 -- gateway/web tool demo (Claude Haiku).
+# System prompt for Q4 -- Cedar Gateway tool demo (Claude Haiku).
+# The agent will try to call web_fetch; when denied, it uses the knowledge base.
+# This prompt instructs it to explain what happened and answer from what it knows.
 Q4_GATEWAY_SYSTEM = (
     "You are a clinical research assistant. The user wants you to search for ongoing "
     "clinical trials. You have access to a web_fetch tool to query ClinicalTrials.gov. "
@@ -69,8 +141,9 @@ Q4_GATEWAY_SYSTEM = (
 )
 
 # System prompt for free-form question routing (Claude Haiku).
-# Maps any question to one of three response paths used by the demo.
-# Reply must be exactly one word so max_tokens=5 is sufficient.
+# Maps any user question to one of three demo paths.
+# The reply must be exactly one word so max_tokens=5 is sufficient -- this
+# keeps the routing call under a fraction of a cent.
 ROUTING_SYSTEM = (
     "You are a question classifier for a PCSK9 biomedical knowledge base. "
     "Classify the user's question into exactly one category. "

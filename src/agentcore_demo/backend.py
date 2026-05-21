@@ -1,10 +1,34 @@
 """
-backend.py  --  the Backend interface.
+backend.py  --  the Backend interface (Protocol) for the demo.
 
-The agent depends on this Protocol, not on AWS. agentcore_demo.aws.AwsBackend
-implements it for real; tests provide a fake with the same methods.  Keeping the
-interface here (no boto3 import) means the agent and the whole test suite import
-cleanly with no AWS dependency.
+This module defines the contract between the agent and the outside world.
+The agent (agent.py) depends only on this interface, not on boto3 or any
+AWS service.  This is the standard Python "dependency injection" pattern:
+the agent gets its backend passed in at construction time.
+
+Why a Protocol instead of a base class?
+  Python's typing.Protocol means "any object with these methods works" --
+  no inheritance required.  FakeBackend in fakes.py satisfies the Protocol
+  without subclassing Backend.  This keeps the fake simple and avoids any
+  risk of accidentally inheriting real behavior.
+
+Why is this in its own file?
+  Two reasons:
+    1. agent.py imports Backend (and nothing else AWS-related) so the whole
+       agent module loads cleanly without boto3 or config.py.  Tests can
+       import agent.py directly without any AWS setup.
+    2. AwsBackend (in aws.py) also exports Backend as a re-export, but the
+       canonical definition lives here to avoid circular imports.
+
+What each method is for:
+  retrieve()       -- vector search: find passages relevant to a question.
+  converse()       -- model call: invoke a Bedrock foundation model.
+  code_interpreter_run() -- run Python code in an isolated AgentCore microVM.
+  kb_setup_costs() -- return KB cost context for the sidebar panel.
+  kb_is_ready()    -- check whether the KB has indexed documents.
+  kb_ingest()      -- start/poll an ingestion job.
+  kb_flush()       -- reset ready state for rehearsal.
+  query_gateway()  -- invoke a tool on the AgentCore Gateway (Cedar policy demo).
 """
 
 from __future__ import annotations
@@ -14,62 +38,120 @@ from typing import Protocol
 
 
 class Backend(Protocol):
-    """What agent.py needs from the world. Real impl + test fakes satisfy it."""
+    """What agent.py needs from the world.
+
+    The real implementation is AwsBackend (aws.py).
+    The test/fake implementation is FakeBackend (fakes.py).
+    Both satisfy this Protocol without inheriting from it.
+    """
 
     def retrieve(self, query: str, n: int = 12) -> list[dict]:
-        """Semantic search; returns dicts with text / source / score."""
+        """Run a semantic search and return the n most relevant passages.
+
+        Args:
+            query: the search text (a question or keyword phrase).
+            n: number of passages to return.
+
+        Returns:
+            A list of dicts, each with "text" (str), "source" (PMC ID str),
+            and "score" (float 0.0-1.0, cosine similarity).
+        """
         ...
 
     def converse(
         self, tier: str, system: str, prompt: str, max_tokens: int = 1600
     ) -> tuple[str, dict, list[dict]]:
-        """One model call; returns (text, usage, matches).
+        """Invoke a Bedrock foundation model and return its response.
 
-        usage has *Tokens fields.
-        matches is a list of guardrail hits: [{"name": str, "match": str, "action": str}],
-        empty if no guardrail is configured or no matches were found.
+        Works for both Claude (Haiku, Sonnet, Opus) and Amazon Nova Pro --
+        the Bedrock converse() API accepts all of them with the same shape.
+
+        Args:
+            tier: model tier key, e.g. "haiku", "sonnet", "opus", "nova".
+            system: the system prompt text.
+            prompt: the user message text.
+            max_tokens: maximum number of output tokens.
+
+        Returns:
+            (text, usage, matches) where:
+              - text is the model's response string.
+              - usage is {"inputTokens": int, "outputTokens": int}.
+              - matches is a list of Bedrock Guardrail hits:
+                [{"name": str, "match": str, "action": str}]
+                Empty list if no guardrail is configured or no URLs matched.
         """
         ...
 
     def code_interpreter_run(self, code: str) -> tuple[str, float]:
-        """Run code in a sandbox; returns (stdout, wall_clock_seconds)."""
+        """Run a self-contained Python script in an isolated microVM.
+
+        Args:
+            code: the Python script to execute.
+
+        Returns:
+            (stdout_text, wall_clock_seconds) -- the combined stdout from the
+            script and the execution duration in seconds.
+        """
         ...
 
     def kb_setup_costs(self) -> dict:
-        """Return KB panel costs: {ingestion_usd, storage_usd_per_month}.
+        """Return KB setup costs and quantitative context for the sidebar panel.
 
-        Ingestion: computed from corpus character count (total_chars / 4 tokens
-        × embed rate) — the Bedrock ingestion API does not expose token counts.
-        Storage: derived from S3 Vectors ListVectors count × per-vector bytes —
-        GetVectorBucket has no sizeBytes field.
-        Neither value is metered. NOT included in the live run total.
+        These are NOT live metered charges; they are computed or derived:
+          - ingestion_usd: from corpus char count (Bedrock API has no token count)
+          - storage_usd_per_month: from S3 Vectors vector count × per-vector bytes
+            (GetVectorBucket has no sizeBytes field)
+          - corpus_storage_usd_per_month: from corpus/ dir size × S3 rate
+          - vector_count, vector_size_mb, corpus_files, corpus_size_mb: quantitative
+            context for the sidebar panel
+
+        NOT included in the live run total.
         """
         ...
 
     def kb_is_ready(self) -> bool:
-        """Return True if the KB has indexed documents and is ready to query."""
+        """Return True if the KB has indexed documents and is ready to query.
+
+        The page calls this on load.  Returns False if no completed ingestion
+        job exists, or if kb_flush() has been called to force a re-ingest.
+        """
         ...
 
     def kb_ingest(self, progress_cb: Callable[[int, int], None]) -> dict:
-        """Run (or resume) ingestion, calling progress_cb(indexed, total) as it proceeds.
+        """Start (or resume) a Bedrock ingestion job.
 
-        Returns {ingestion_usd, storage_usd_per_month} when complete.
+        Args:
+            progress_cb: called with (indexed_count, total_expected) at each
+                poll cycle so the browser can update its progress bar.
+
+        Returns:
+            A dict with ingestion_usd, storage_usd_per_month, and other KB
+            setup cost fields (same as kb_setup_costs()).
         """
         ...
 
     def kb_flush(self) -> None:
-        """Mark the KB for re-ingestion.
+        """Mark the KB as needing re-ingestion.
 
-        On next kb_ingest() call a fresh ingestion job will run.  The AWS-side
-        KB stays indexed; this only resets local state so the ingestion view
-        will appear again (rehearsal tool).
+        Does NOT delete anything from AWS.  The next call to kb_ingest()
+        will start a new ingestion job.  Used during rehearsal to re-watch
+        the ingestion progress animation without actually re-indexing.
         """
         ...
 
     def query_gateway(self, tool_name: str, arguments: dict) -> dict:
         """Invoke a tool on the AgentCore Gateway.
 
-        Returns {"result": ...} on success, or {"denied": True, "reason": ...}
-        when a Cedar policy denies the request (HTTP 403) or no gateway is configured.
+        The Gateway enforces Cedar policies.  In the demo, the ForbidWeb
+        policy denies any call where tool_name == "web_fetch".
+
+        Args:
+            tool_name: the short tool name (without the target prefix).
+            arguments: tool arguments dict (e.g. {"url": "https://..."}).
+
+        Returns:
+            {"result": response_body}  on success, or
+            {"denied": True, "reason": "..."}  if the Cedar policy denied
+            the call or no gateway URL is configured.
         """
         ...

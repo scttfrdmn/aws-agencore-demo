@@ -1,28 +1,49 @@
 """
-aws.py  --  the AWS backend for the demo.
+aws.py  --  the real AWS backend for the demo.
 
-One class, AwsBackend, wrapping the things the agent needs:
-  retrieve()             -> Bedrock Knowledge Bases
-  converse()             -> Bedrock model invocation (Claude + Nova)
-  code_interpreter_run() -> AgentCore Code Interpreter
-  kb_setup_costs()       -> KB panel costs (computed from corpus + vector count)
-  kb_is_ready()          -> check whether KB has indexed documents
-  kb_ingest()            -> start/poll an ingestion job with progress callback
-  kb_flush()             -> reset local state to force a re-ingest
+This module provides AwsBackend, the live implementation of the Backend
+protocol.  It wraps every AWS service call the agent needs:
 
-Verified 2026-05-20:
-  - Bedrock ingestion job statistics: only document counts, NO token counts.
-    Ingestion cost is computed from corpus character count (total_chars / 4
-    tokens × embed rate).  Labelled "computed from corpus size", not metered.
-  - S3 Vectors GetVectorBucket: no sizeBytes field.
-    Storage cost is derived from ListVectors count × per-vector bytes (Titan
-    Embed V2: 1024 float32 = 4096 bytes, plus ~512 bytes metadata overhead).
-    Labelled "from vector count", not metered.
-  - temperature is deprecated for Claude Opus 4.7; inferenceConfig uses only
-    maxTokens.
+  retrieve()             -> Bedrock Knowledge Bases vector search
+  converse()             -> Bedrock model invocation (Claude and Amazon Nova)
+  code_interpreter_run() -> AgentCore Code Interpreter (isolated microVM)
+  kb_setup_costs()       -> one-time + monthly KB costs for the sidebar panel
+  kb_is_ready()          -> check whether the KB has indexed documents
+  kb_ingest()            -> start/poll an ingestion job with a progress callback
+  kb_flush()             -> reset local state to force a fresh ingest (rehearsal)
+  query_gateway()        -> invoke a tool on the AgentCore Gateway (Cedar policy)
 
-API shapes here were verified against current AWS docs -- do not "fix" them
-without checking.
+No AWS calls happen at import time -- the boto3 clients are constructed in
+__init__ so the module is safe to import in tests (which use FakeBackend).
+
+Verified AWS quirks (do not "fix" these without checking current docs):
+
+  Ingestion statistics (2026-05-20):
+    The Bedrock ingestion job statistics block only contains document counts.
+    There is NO token count in the API response.  Ingestion cost is therefore
+    computed from local corpus character count: total_chars / 4 tokens × embed
+    rate.  The cost is labelled "computed from corpus size" (not metered).
+
+  S3 Vectors storage size (2026-05-20):
+    GetVectorBucket does NOT return a sizeBytes field.  Storage cost is derived
+    by counting vectors via ListVectors and multiplying by the known per-vector
+    byte size for Titan Embed V2 (1024 float32 = 4096 bytes, plus ~512 bytes of
+    metadata overhead per vector).  Labelled "from vector count" (not metered).
+
+  Claude Opus 4.7 inference config (2026-05-20):
+    temperature and topP are deprecated for Opus 4.7.  Passing them returns
+    HTTP 400.  The converse() call omits both; only maxTokens is set.
+    (This is why inferenceConfig only ever contains maxTokens in this file.)
+
+  Cedar policy denial shape (2026-05-21):
+    A Cedar ENFORCE denial comes back as HTTP 200 with a JSON-RPC error body
+    containing "Tool Execution Denied: ..." in the message field -- NOT as
+    HTTP 403.  query_gateway() checks for this pattern explicitly.
+
+  AgentCore Gateway tool naming (2026-05-21):
+    MCP tool names on the gateway use the format "{target-name}___{tool-name}"
+    (three underscores).  Our target is named "web-tools", so web_fetch becomes
+    "web-tools___web_fetch" in the tools/call JSON-RPC payload.
 """
 
 from __future__ import annotations
@@ -37,14 +58,31 @@ from agentcore_demo.backend import Backend
 
 __all__ = ["AwsBackend", "Backend"]
 
-_EXPECTED_CORPUS_SIZE = 657  # actual corpus size (CC0/CC BY PCSK9 papers from PMC)
+# Actual number of CC0/CC BY PCSK9 papers pulled from PMC.
+# Used as the denominator in the ingestion progress bar.
+_EXPECTED_CORPUS_SIZE = 657
+
+# Titan Embed V2 produces 1024-dimensional float32 vectors.
+# Each float32 is 4 bytes, so the vector data alone is 4 096 bytes.
+# S3 Vectors also stores per-vector metadata; we budget ~512 bytes for that.
+# This constant is used to estimate storage cost when ListVectors is called.
+_BYTES_PER_VECTOR = 4096 + 512
 
 
 def _format_source(uri: str) -> str:
-    """Convert an S3 URI to a readable PMC citation.
+    """Convert an S3 URI to a readable PMC article ID.
 
-    s3://inside-the-lines-corpus/corpus/PMC13156736.txt  →  PMC13156736
+    The KB returns source locations like:
+        s3://inside-the-lines-corpus/corpus/PMC13156736.txt
+
+    We extract just the PMC ID so the UI can render a clean citation link.
     Falls back to the raw URI if the pattern doesn't match.
+
+    Args:
+        uri: an S3 URI string from a Bedrock retrieval result.
+
+    Returns:
+        A PMC ID string like "PMC13156736", or the original URI.
     """
     import re  # noqa: PLC0415
 
@@ -52,12 +90,13 @@ def _format_source(uri: str) -> str:
     return m.group(1) if m else uri
 
 
-# Titan Embed V2 produces 1024-float32 vectors (4 096 B) + ~512 B metadata overhead.
-_BYTES_PER_VECTOR = 4096 + 512
-
-
 class AwsBackend:
-    """Real AWS implementation of Backend."""
+    """Real AWS implementation of the Backend protocol.
+
+    Constructed once per process by app._build_backend() or run._build().
+    All boto3 clients are created here so that tests (which import Backend
+    but use FakeBackend) never trigger any AWS credentials check.
+    """
 
     def __init__(
         self,
@@ -71,6 +110,19 @@ class AwsBackend:
         guardrail_version: str = "DRAFT",
         gateway_url: str = "",
     ):
+        """
+        Args:
+            region: AWS region (e.g. "us-west-2").
+            kb_id: the Bedrock Knowledge Base ID from config.py.
+            ds_id: the data source ID from config.py.
+            models: dict mapping tier names ("haiku", "sonnet", etc.) to
+                Bedrock inference profile IDs.
+            rates: dict of pricing rates from pricing.fetch_rates().
+            vector_bucket_name: the S3 Vectors bucket name for storage cost estimation.
+            guardrail_id: optional Bedrock Guardrail ID; empty string disables it.
+            guardrail_version: the guardrail version to use (default "DRAFT").
+            gateway_url: optional AgentCore Gateway URL; empty string disables it.
+        """
         self.region = region
         self.kb_id = kb_id
         self.ds_id = ds_id
@@ -80,14 +132,42 @@ class AwsBackend:
         self.guardrail_id = guardrail_id
         self.guardrail_version = guardrail_version
         self.gateway_url = gateway_url
-        self._kb = boto3.client("bedrock-agent-runtime", region_name=region)
-        self._llm = boto3.client("bedrock-runtime", region_name=region)
-        self._agent = boto3.client("bedrock-agent", region_name=region)
-        self._ingestion_stats: dict | None = None  # populated after kb_ingest()
+
+        # Separate boto3 clients for the three different Bedrock service endpoints.
+        self._kb = boto3.client("bedrock-agent-runtime", region_name=region)  # retrieval
+        self._llm = boto3.client("bedrock-runtime", region_name=region)  # model calls
+        self._agent = boto3.client("bedrock-agent", region_name=region)  # ingestion mgmt
+
+        # Set after kb_ingest() completes; used by kb_setup_costs() to avoid
+        # re-fetching stats on every sidebar refresh.
+        self._ingestion_stats: dict | None = None
+
+        # Set to True by kb_flush() to force a new ingestion on next call.
         self._force_reingest: bool = False
 
     def retrieve(self, query: str, n: int = 12) -> list[dict]:
-        """Semantic search over the Bedrock Knowledge Base."""
+        """Run a semantic search against the Bedrock Knowledge Base.
+
+        Sends the query to the KB's vector search endpoint, which embeds the
+        query text and returns the n most similar document chunks.
+
+        The Bedrock retrieval API shape (verified 2026-05-20):
+            client.retrieve(
+                knowledgeBaseId=...,
+                retrievalQuery={"text": query},
+                retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": n}},
+            )
+            → retrievalResults[].content.text  (the chunk text)
+            → retrievalResults[].location.s3Location.uri  (the source S3 path)
+            → retrievalResults[].score  (cosine similarity, 0.0 – 1.0)
+
+        Args:
+            query: the question or search phrase to embed.
+            n: number of passages to return (default 12; Q2/Q3 use 16).
+
+        Returns:
+            A list of dicts with keys "text", "source" (PMC ID), and "score".
+        """
         resp = self._kb.retrieve(
             knowledgeBaseId=self.kb_id,
             retrievalQuery={"text": query},
@@ -107,26 +187,56 @@ class AwsBackend:
     def converse(
         self, tier: str, system: str, prompt: str, max_tokens: int = 1600
     ) -> tuple[str, dict, list[dict]]:
-        """One Bedrock converse call. Works uniformly for Claude and Nova.
+        """Invoke a Bedrock foundation model and return text, token usage, and guardrail hits.
 
-        Returns (text, usage, matches) where matches is a list of guardrail hits:
-        [{"name": str, "match": str, "action": str}], empty if no guardrail or no hits.
+        Uses the Bedrock Runtime converse() API, which works uniformly for
+        both Claude models and Amazon Nova -- the same request shape, the same
+        response shape.  This is the key Bedrock abstraction that makes it
+        easy to swap models.
+
+        Guardrail integration:
+            If guardrail_id is set, the guardrail config is attached to every
+            call.  When the guardrail matches (e.g. a URL in the output),
+            the trace contains an outputAssessments block.  This function
+            extracts those matches and returns them as the third tuple element
+            so agent.py can substitute local corpus links.
+
+        Important: temperature is intentionally omitted from inferenceConfig.
+            Claude Opus 4.7 rejects temperature in the request body (returns
+            HTTP 400).  Using only maxTokens works for all models including
+            Haiku, Sonnet, Opus, and Nova Pro.  (Verified 2026-05-20.)
+
+        Args:
+            tier: a key into self.models, e.g. "haiku", "sonnet", "opus", "nova".
+            system: the system prompt text.
+            prompt: the user message text.
+            max_tokens: the maximum number of output tokens to generate.
+
+        Returns:
+            (text, usage, matches) where:
+              - text is the model's response string.
+              - usage is a dict with "inputTokens" and "outputTokens".
+              - matches is a list of guardrail hits:
+                [{"name": str, "match": str, "action": str}], empty if none.
         """
         kwargs: dict = {
             "modelId": self.models[tier],
             "system": [{"text": system}],
             "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            # temperature is deliberately absent -- Opus 4.7 rejects it.
             "inferenceConfig": {"maxTokens": max_tokens},
         }
         if self.guardrail_id:
             kwargs["guardrailConfig"] = {
                 "guardrailIdentifier": self.guardrail_id,
                 "guardrailVersion": self.guardrail_version,
-                "trace": "enabled",
+                "trace": "enabled",  # needed to see which URLs were intercepted
             }
         resp = self._llm.converse(**kwargs)
         text = resp["output"]["message"]["content"][0]["text"]
 
+        # Parse guardrail matches from the response trace.
+        # The trace structure: resp.trace.guardrail.outputAssessments.{assessmentId: [...]}.
         matches: list[dict] = []
         if self.guardrail_id:
             assessments = resp.get("trace", {}).get("guardrail", {}).get("outputAssessments", {})
@@ -142,8 +252,33 @@ class AwsBackend:
         return text, resp["usage"], matches
 
     def code_interpreter_run(self, code: str) -> tuple[str, float]:
-        """Execute code in an isolated AgentCore Code Interpreter microVM."""
-        from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
+        """Execute Python code in an isolated AgentCore Code Interpreter microVM.
+
+        The Code Interpreter runs in a fresh, ephemeral container for each
+        invocation.  It has matplotlib, numpy, and pandas pre-installed.
+        The generated code from Q2 ends by printing a base64 PNG string;
+        agent._extract_chart() picks that out of the stdout.
+
+        AgentCore Code Interpreter API shape (verified 2026-05-20):
+            from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
+            ci = CodeInterpreter(region)
+            ci.start()
+            resp = ci.invoke("executeCode", {"language": "python", "code": code})
+            # resp["stream"] is a generator of event dicts
+            # each event: {"result": {"content": [{"type": "text", "text": "..."}]}}
+            ci.stop()
+
+        The start/stop pattern is important: ci.start() provisions the microVM,
+        and ci.stop() releases it so you are not charged while idle.
+
+        Args:
+            code: a self-contained Python script to run.
+
+        Returns:
+            (stdout, wall_clock_seconds) where stdout is all text output
+            concatenated, and wall_clock_seconds is the execution time.
+        """
+        from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter  # noqa: PLC0415
 
         ci = CodeInterpreter(self.region)
         ci.start()
@@ -157,10 +292,21 @@ class AwsBackend:
                         out.append(block["text"])
             return "\n".join(out), time.time() - t0
         finally:
+            # Always stop the interpreter even if the code raises an exception,
+            # so the microVM is released and billing stops.
             ci.stop()
 
     def kb_is_ready(self) -> bool:
-        """Return True if the KB has at least one completed ingestion job with indexed docs."""
+        """Return True if the KB has at least one completed ingestion job with indexed docs.
+
+        The page calls this on load to decide whether to show the ingestion
+        progress view or go straight to the question prompt.
+
+        Returns False in two cases:
+          - No completed ingestion jobs exist yet (build_kb.py hasn't been run,
+            or ingestion is still in progress).
+          - kb_flush() was called to force a re-ingest (rehearsal mode).
+        """
         if self._force_reingest:
             return False
         try:
@@ -171,18 +317,36 @@ class AwsBackend:
             for job in jobs.get("ingestionJobSummaries", []):
                 if job.get("status") == "COMPLETE":
                     stats = job.get("statistics", {})
+                    # Require at least one indexed document -- an empty COMPLETE
+                    # job means ingestion ran but found nothing to index.
                     if stats.get("numberOfNewDocumentsIndexed", 0) > 0:
                         return True
         except Exception:
+            # If the KB ID is wrong or AWS is unreachable, treat as not ready.
             pass
         return False
 
     def kb_ingest(self, progress_cb: Callable[[int, int], None]) -> dict:
-        """Start an ingestion job and poll until complete, reporting progress.
+        """Start a Bedrock ingestion job and poll until it completes.
 
-        Returns a costs dict suitable for the setup_cost event.
+        Called by the /ingest WebSocket endpoint.  Sends progress updates via
+        progress_cb(indexed, total) so the browser can show a progress bar.
+
+        After ingestion completes, computes the one-time setup costs:
+          - ingestion_usd: from local corpus char count (API has no token count)
+          - storage_usd_per_month: from vector count × per-vector bytes
+          - corpus_storage_usd_per_month: from local corpus dir size × S3 rate
+
+        Args:
+            progress_cb: called with (indexed_count, total_expected) at each poll.
+
+        Returns:
+            A dict suitable for the kb_ready WebSocket event:
+            {"ingestion_usd": float, "storage_usd_per_month": float, ...}
         """
+        # Emit a 0/total progress tick immediately so the browser shows the bar.
         progress_cb(0, _EXPECTED_CORPUS_SIZE)
+
         job_id = self._agent.start_ingestion_job(
             knowledgeBaseId=self.kb_id,
             dataSourceId=self.ds_id,
@@ -196,16 +360,17 @@ class AwsBackend:
                 ingestionJobId=job_id,
             )["ingestionJob"]
             stats = st.get("statistics", {})
+            # Count both new and modified documents for the progress bar.
             indexed = stats.get("numberOfNewDocumentsIndexed", 0) + stats.get(
                 "numberOfModifiedDocumentsIndexed", 0
             )
             progress_cb(indexed, _EXPECTED_CORPUS_SIZE)
             if st["status"] in ("COMPLETE", "FAILED"):
                 break
-            time.sleep(3)
+            time.sleep(3)  # poll every 3 seconds
 
-        # Ingestion cost: computed from corpus char count (total_chars / 4 tokens).
-        # The ingestion API reports document counts only, not token counts.
+        # Ingestion cost: the API reports document counts only, not token counts.
+        # We compute from the local corpus directory instead.
         ingestion_usd = self._compute_ingestion_cost_from_corpus()
         storage_usd = self._compute_storage_cost_from_vector_count()
 
@@ -218,17 +383,41 @@ class AwsBackend:
         return dict(self._ingestion_stats)
 
     def kb_flush(self) -> None:
-        """Reset local state so the next kb_ingest() triggers a new ingestion job."""
+        """Reset local state so the next kb_ingest() triggers a fresh ingestion job.
+
+        This does NOT delete anything from AWS -- the KB stays fully indexed.
+        It only clears the local ready flag so the ingestion progress view
+        reappears in the browser.  Useful for rehearsal: you can re-watch the
+        ingestion animation without actually re-indexing all 650 papers.
+        """
         self._force_reingest = True
         self._ingestion_stats = None
 
     def query_gateway(self, tool_name: str, arguments: dict) -> dict:
         """Invoke a tool on the AgentCore Gateway via the MCP HTTP endpoint.
 
-        POSTs a JSON-RPC 2.0 tools/call request to ``{gateway_url}/mcp``.
-        Returns ``{"result": body}`` on success, or
-        ``{"denied": True, "reason": ...}`` on a Cedar policy denial (HTTP 403)
-        or when no gateway URL is configured.
+        The Gateway exposes tools over an MCP-compatible JSON-RPC HTTP interface.
+        We POST a tools/call request and inspect the response for Cedar policy
+        denials.
+
+        Cedar policy denial quirk (verified 2026-05-21):
+            Denials arrive as HTTP 200 with a JSON-RPC error body, NOT HTTP 403.
+            The error message contains "Tool Execution Denied" or "not allowed".
+            This function checks for both patterns and returns {"denied": True}.
+
+        MCP tool naming quirk (verified 2026-05-21):
+            The Gateway prefixes tool names with the target name plus three
+            underscores.  Our gateway target is "web-tools", so the web_fetch
+            tool must be requested as "web-tools___web_fetch".
+
+        Args:
+            tool_name: the short tool name (e.g. "web_fetch" -- without the prefix).
+            arguments: a dict of tool arguments (e.g. {"url": "https://..."}).
+
+        Returns:
+            {"result": response_body}  on success, or
+            {"denied": True, "reason": "..."} if Cedar policy denied the call
+            or no gateway is configured.
         """
         import json  # noqa: PLC0415
         import ssl  # noqa: PLC0415
@@ -238,8 +427,8 @@ class AwsBackend:
         if not self.gateway_url:
             return {"denied": True, "reason": "No gateway configured"}
 
-        # The Gateway MCP protocol prefixes tool calls with "{target-name}___"
-        # Our target is named "web-tools", so web_fetch becomes "web-tools___web_fetch"
+        # Prepend the target name to form the full MCP tool name.
+        # "web-tools" is the name of the Lambda-backed gateway target.
         mcp_tool_name = f"web-tools___{tool_name}"
 
         payload = json.dumps(
@@ -255,13 +444,16 @@ class AwsBackend:
             self.gateway_url.rstrip("/") + "/mcp",
             data=payload,
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
         )
         ctx = ssl.create_default_context()
         try:
             with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
                 body = json.loads(resp.read())
-                # Cedar policy denials come as HTTP 200 with a JSON-RPC error body
+                # Cedar denials are HTTP 200 with an "error" key in the JSON-RPC body.
                 if "error" in body:
                     msg = body["error"].get("message", "")
                     if "Denied" in msg or "policy" in msg.lower() or "not allowed" in msg.lower():
@@ -270,23 +462,35 @@ class AwsBackend:
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             if e.code == 403:
+                # Fallback: some configurations do return HTTP 403.
                 return {"denied": True, "reason": f"Cedar policy denied: {body[:200]}"}
             return {"denied": True, "reason": f"HTTP {e.code}: {body[:200]}"}
         except Exception as ex:  # noqa: BLE001
             return {"denied": True, "reason": str(ex)}
 
     def kb_setup_costs(self) -> dict:
-        """Return KB setup costs + quantitative context for the UI panel.
+        """Return KB setup costs and quantitative context for the sidebar panel.
 
-        Ingestion:       computed from corpus char count (total_chars / 4 × embed rate).
-        Vector storage:  derived from S3 Vectors ListVectors count × per-vector bytes.
-        Corpus storage:  corpus dir size × S3 standard rate (first 50 TB tier).
-        None are metered charges.  NOT included in the live run total.
+        This is called by the /api/kb-costs HTTP endpoint.  The returned dict
+        feeds the "Knowledge Base" panel in the UI, which displays:
+          - How much it cost to embed and index the corpus (one-time)
+          - How much the vector store costs per month (ongoing)
+          - How many papers and vectors are in the corpus
+
+        None of these are live metered charges -- they are computed or derived:
+          - ingestion_usd: computed from corpus/ dir char count (API has no tokens)
+          - storage_usd_per_month: derived from vector count × per-vector bytes
+            (GetVectorBucket has no sizeBytes field -- verified 2026-05-20)
+          - corpus_storage_usd_per_month: from corpus/ dir size × S3 rate
+
+        These costs are NOT included in the run total shown on the receipt.
         """
-        # Quantitative context (always fresh — cheap local stats)
+        # Measure fresh stats on every call -- cheap local computation.
         vector_count, vector_size_mb = self._measure_vector_stats()
         corpus_files, corpus_size_mb = self._measure_corpus_stats()
 
+        # Use stats from the most recent ingestion job if available;
+        # otherwise recompute from scratch.
         base = (
             self._ingestion_stats
             if self._ingestion_stats is not None
@@ -307,7 +511,16 @@ class AwsBackend:
     # -- private helpers --------------------------------------------------
 
     def _measure_vector_stats(self) -> tuple[int, float]:
-        """Return (vector_count, size_mb) from S3 Vectors ListVectors."""
+        """Count live vectors in S3 Vectors and estimate their storage size.
+
+        GetVectorBucket does not return a sizeBytes field, so we page through
+        all vectors with ListVectors and multiply by the known bytes-per-vector
+        for Titan Embed V2.  This is only called for the sidebar panel and runs
+        quickly for a ~650-paper corpus.
+
+        Returns:
+            (vector_count, size_mb)
+        """
         try:
             import boto3  # noqa: PLC0415
 
@@ -323,10 +536,15 @@ class AwsBackend:
             size_mb = n * _BYTES_PER_VECTOR / (1024 * 1024)
             return n, size_mb
         except Exception:
+            # If the bucket name is wrong or S3 Vectors is unavailable, return zeros.
             return 0, 0.0
 
     def _measure_corpus_stats(self) -> tuple[int, float]:
-        """Return (file_count, size_mb) from the local corpus directory."""
+        """Count files and total size of the local corpus/ directory.
+
+        Returns:
+            (file_count, size_mb)
+        """
         corpus_dir = "corpus"
         if not os.path.isdir(corpus_dir):
             return 0, 0.0
@@ -335,12 +553,19 @@ class AwsBackend:
         return len(files), total_bytes / (1024 * 1024)
 
     def _compute_ingestion_cost_from_corpus(self) -> float:
-        """Compute embedding cost from local corpus character count.
+        """Estimate embedding cost from local corpus character count.
 
-        Bedrock ingestion does not expose a token count.  We walk the corpus/
-        directory that was synced to S3, sum raw character counts, and
-        approximate tokens at 4 chars/token.  Returns 0.0 if corpus/ is absent
-        or the embed rate is unknown.
+        The Bedrock ingestion job statistics block only reports document counts,
+        not token counts.  As a proxy we walk the local corpus/ directory,
+        sum raw byte sizes (which approximately equal character counts for UTF-8
+        English text), and divide by 4 to get a rough token estimate.
+
+        The "4 chars per token" heuristic is consistent with common tokenizer
+        behavior for English text (GPT-4, Llama-2, Titan all average ~4 chars/token).
+
+        Returns 0.0 if:
+          - corpus/ does not exist (script run on a different machine)
+          - the embed rate is not known (pricing lookup failed)
         """
         embed_rate = self.rates.get("embed_usd_per_1m_tokens", 0.0)
         if embed_rate <= 0:
@@ -353,16 +578,21 @@ class AwsBackend:
             for root, _dirs, files in os.walk(corpus_dir)
             for f in files
         )
-        approx_tokens = total_chars / 4
+        approx_tokens = total_chars / 4  # 4 chars per token approximation
         return (approx_tokens / 1_000_000) * embed_rate
 
     def _compute_storage_cost_from_vector_count(self) -> float:
         """Derive monthly storage cost from the live vector count in S3 Vectors.
 
-        S3 Vectors GetVectorBucket exposes no sizeBytes field.  We count vectors
-        via ListVectors and estimate bytes as n_vectors × _BYTES_PER_VECTOR
-        (Titan Embed V2: 4096 B float32 data + 512 B metadata overhead).
-        Returns 0.0 if the bucket name is unknown or the rate is not set.
+        S3 Vectors' GetVectorBucket API does not expose a sizeBytes field
+        (verified 2026-05-20), so we cannot read the storage size directly.
+        Instead we count vectors via ListVectors and multiply by the known
+        per-vector byte count:
+            Titan Embed V2: 1024 floats × 4 bytes = 4096 bytes of vector data
+            plus ~512 bytes of per-vector metadata overhead
+            total: _BYTES_PER_VECTOR = 4608 bytes per vector
+
+        Returns 0.0 if the bucket name or storage rate is unknown.
         """
         storage_rate = self.rates.get("s3v_storage_usd_per_gb_month", 0.0)
         bucket = self.vector_bucket_name
@@ -378,7 +608,7 @@ class AwsBackend:
             for page in paginator.paginate(
                 vectorBucketName=bucket,
                 indexName=index_name,
-                # include only keys, not data, for speed
+                # We only need the count, not the actual vector data.
             ):
                 n_vectors += len(page.get("vectors", []))
             size_bytes = n_vectors * _BYTES_PER_VECTOR
@@ -388,10 +618,14 @@ class AwsBackend:
             return 0.0
 
     def _compute_corpus_s3_storage_cost(self) -> float:
-        """Compute monthly S3 storage cost for the local corpus directory.
+        """Compute monthly S3 standard storage cost for the local corpus directory.
 
-        Uses S3 standard rate (first 50 TB tier, us-west-2: $0.023/GB-month).
-        Falls back to a hard-coded rate if the Price List call wasn't made.
+        Uses the S3 standard storage rate (first 50 TB tier, us-west-2: $0.023/GB-month).
+        For a 650-paper corpus of ~10 MB the cost is fractions of a cent -- included
+        in the sidebar for completeness, not because it's a meaningful expense.
+
+        Falls back to the hard-coded $0.023/GB-month rate if the Price List
+        lookup in pricing.py was not available at startup.
         """
         s3_rate = self.rates.get("s3_standard_usd_per_gb_month", 0.023)
         corpus_dir = "corpus"

@@ -1,17 +1,30 @@
 """
 run.py  --  headless terminal runner for the Inside the Lines demo.
 
-Builds the real AwsBackend + CostMeter from config.py (same seam as app.py),
-runs the three questions through Agent, and prints a live transcript to stdout.
-It is a terminal consumer of the same emit() event stream the WebSocket uses —
-no new cost logic, no new question text.
+Builds the same AwsBackend + CostMeter used by the web app, runs the
+questions through the Agent, and prints a live transcript to stdout.
+
+Why use this instead of the web app?
+  - To verify the demo works end-to-end BEFORE the talk, without opening
+    a browser.  If something is misconfigured (wrong KB ID, missing model
+    access), you'll see the error immediately in the terminal.
+  - To run a single question cheaply during development: `--questions 1`
+    runs Q1 only (Claude Haiku, a few cents) without the full three-question run.
+  - To check the receipt total before committing to the full demo.
+
+Headless mode means no WebSocket, no browser -- just the same event stream
+printed to the terminal with a simple formatter (_emit_to_terminal).  The
+event protocol is identical to the WebSocket version, so a passing headless
+run confirms the web app will also work.
 
 Usage:
-    python -m agentcore_demo.run                # all three questions
-    python -m agentcore_demo.run --questions 1  # Q1 only (cheap iteration)
-    python -m agentcore_demo.run --questions 1,3
+    python -m agentcore_demo.run                # run Q1, Q2, Q3
+    python -m agentcore_demo.run --questions 1  # Q1 only
+    python -m agentcore_demo.run --questions 1,3  # Q1 and Q3
+    python -m agentcore_demo.run --questions 4  # Q4 only (Cedar policy demo)
 
-    DEMO_FAKE=1 python -m agentcore_demo.run    # fake backend (no AWS)
+    DEMO_FAKE=1 python -m agentcore_demo.run    # fake backend (no AWS, no cost)
+    make demo-headless                          # same as the default run
 """
 
 from __future__ import annotations
@@ -38,15 +51,22 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build() -> tuple:
-    """Build backend + meter using the same factory logic as app.py."""
+    """Build backend + meter using the same factory logic as app.py.
+
+    Mirrors app._build_backend() and app._build_meter() so that the
+    headless run and the web run always use the same configuration.
+    Any difference here would mean a run that passes headless could fail
+    in the browser (or vice versa).
+    """
     import os
 
     if os.environ.get("DEMO_FAKE") == "1":
+        # Fake mode: no AWS, no config.py needed.  Good for development.
         from agentcore_demo.fakes import make_fake_backend_and_meter  # noqa: PLC0415
 
         return make_fake_backend_and_meter()
 
-    # Real AWS path — identical to app._build_backend / app._build_meter
+    # Real AWS path -- requires config.py to be present and populated.
     import importlib.util  # noqa: PLC0415
 
     if importlib.util.find_spec("config") is None:
@@ -78,12 +98,16 @@ def _build() -> tuple:
 
 
 # ── terminal renderer ─────────────────────────────────────────────────────────
+# These constants and functions format the event stream as plain text.
+# The event types mirror the WebSocket protocol in agent.py -- if you add
+# a new event type there, add a matching elif branch here.
 
 _WIDTH = 78
 _HR = "─" * _WIDTH
 
 
 def _hr(label: str = "") -> None:
+    """Print a horizontal rule, optionally with a centred label."""
     if label:
         pad = _WIDTH - len(label) - 4
         print(f"── {label} {'─' * max(0, pad)}")
@@ -91,10 +115,16 @@ def _hr(label: str = "") -> None:
         print(_HR)
 
 
-def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentional)
+def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like structure, intentional)
+    """Print one event to the terminal in a readable format.
+
+    This is the terminal equivalent of the Alpine.js UI renderer in
+    static/index.html.  Both consume the same event protocol.
+    """
     t = ev["type"]
 
     if t == "setup_cost":
+        # KB panel costs -- printed once at the start of the run.
         print(f"\n{'KB SETUP COSTS (not in run total)':^{_WIDTH}}")
         print(_HR)
         print(f"  Corpus ingestion (computed from corpus size):  ${ev['ingestion_usd']:.4f}")
@@ -103,6 +133,7 @@ def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentiona
         print()
 
     elif t == "question":
+        # Question header -- printed before each question's output.
         print(f"\n{'':=<{_WIDTH}}")
         print(f"  QUESTION {ev['n']}")
         for line in textwrap.wrap(ev["text"], _WIDTH - 4):
@@ -110,12 +141,15 @@ def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentiona
         print(f"{'':=<{_WIDTH}}")
 
     elif t == "phase":
+        # Status line -- retrieval, code running, etc.
         print(f"  ▸ {ev['label']}")
 
     elif t == "retrieval":
         print(f"  ▸ retrieved {ev['count']} passages")
 
     elif t == "model":
+        # "start" shows the model name with trailing dots; "done" overwrites
+        # with token counts and cost on the same line.
         if ev["state"] == "start":
             print(f"  ○ {ev['label']} …", end="", flush=True)
         else:
@@ -128,6 +162,7 @@ def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentiona
             )
 
     elif t == "code":
+        # Show the first 12 lines of generated code -- enough to verify it looks right.
         print("\n  ── Generated code ──")
         for line in ev["text"].splitlines()[:12]:
             print(f"    {line}")
@@ -137,10 +172,12 @@ def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentiona
         print()
 
     elif t == "chart":
+        # Charts can't be displayed in the terminal -- just report the size.
         kb = len(ev["data"]) * 3 // 4 // 1024
         print(f"  ▸ chart: {kb} KB PNG (base64, not displayed in terminal)")
 
     elif t == "answer":
+        # Model answer -- show the first 20 wrapped lines.
         print(f"\n  ┌── {ev['title']}")
         wrapped = textwrap.wrap(ev["text"], _WIDTH - 6)
         for line in wrapped[:20]:
@@ -150,9 +187,12 @@ def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentiona
         print(f"  └{'─' * (_WIDTH - 3)}")
 
     elif t == "cost":
-        pass  # running total printed per-model; suppress intermediate updates
+        # Running total is emitted after every model call; suppress here
+        # since each model row already shows its own cost.
+        pass
 
     elif t == "receipt":
+        # Final itemised receipt -- same data the browser renders as a table.
         print(f"\n{'RECEIPT':^{_WIDTH}}")
         print(_HR)
         print(f"  {'Step':<26} {'Model':<22} {'In':>7} {'Out':>6} {'Cost':>11}")
@@ -170,6 +210,7 @@ def _emit_to_terminal(ev: dict) -> None:  # noqa: C901  (switch-like, intentiona
 
 
 def main() -> None:
+    """Entry point: parse arguments, build backend, run agent, print receipt."""
     args = _parse_args()
     try:
         which = tuple(int(n.strip()) for n in args.questions.split(","))
