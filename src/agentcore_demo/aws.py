@@ -37,7 +37,7 @@ from agentcore_demo.backend import Backend
 
 __all__ = ["AwsBackend", "Backend"]
 
-_EXPECTED_CORPUS_SIZE = 1000  # nominal document count for progress display
+_EXPECTED_CORPUS_SIZE = 657  # actual corpus size (CC0/CC BY PCSK9 papers from PMC)
 
 
 def _format_source(uri: str) -> str:
