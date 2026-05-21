@@ -18,9 +18,8 @@ What this script deletes (and approximate ongoing costs if left running):
   - S3 corpus bucket         -- ~$0.023/GB-month for standard storage
                                 (~$0.023 × 0.01 GB ≈ negligible, but accumulates)
 
-What this script does NOT delete:
-  - The local corpus/ directory  -- it is on your laptop, not in AWS.
-    Delete it manually if you want to free disk space.
+What this script deletes locally:
+  - corpus/  -- the downloaded papers on your laptop (re-run corpus_fetch.py to rebuild)
 
 How it works:
   Each deletion is wrapped in _try() so that a single failure (e.g. a
@@ -75,16 +74,94 @@ def _delete_bucket(bucket: str) -> None:
 
 
 if __name__ == "__main__":
+    import time
+
     # --- Gateway and Cedar policy engine ----------------------------------
-    # Delete the Gateway first; the PolicyEngine can only be deleted after
-    # all gateways that reference it are gone.
+    # Order matters: targets → gateway → policy engine.
+    # The PolicyEngine cannot be deleted while any gateway references it.
     if getattr(cfg, "GATEWAY_ID", ""):
+        # Delete all Gateway targets first (the web-tools Lambda target).
+        # The Gateway cannot be deleted while targets exist.
+        try:
+            targets = br_ctrl.list_gateway_targets(gatewayIdentifier=cfg.GATEWAY_ID).get(
+                "items", []
+            )
+            for t in targets:
+                _try(
+                    f"gateway target {t['name']} ({t['targetId']})",
+                    lambda tid=t["targetId"]: br_ctrl.delete_gateway_target(
+                        gatewayIdentifier=cfg.GATEWAY_ID, targetId=tid
+                    ),
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  skip (list gateway targets): {type(e).__name__}")
+
+        # Detach the policy engine before deleting the gateway.
+        # delete_gateway() returns ValidationException if a policy engine is attached.
+        try:
+            gw_detail = br_ctrl.get_gateway(gatewayIdentifier=cfg.GATEWAY_ID)
+            if gw_detail.get("policyEngineConfiguration"):
+                br_ctrl.update_gateway(
+                    gatewayIdentifier=cfg.GATEWAY_ID,
+                    name=gw_detail["name"],
+                    roleArn=gw_detail["roleArn"],
+                    authorizerType=gw_detail["authorizerType"],
+                    # Empty policyEngineConfiguration detaches it
+                )
+                # Wait for update to settle
+                for _ in range(10):
+                    if br_ctrl.get_gateway(gatewayIdentifier=cfg.GATEWAY_ID)["status"] == "READY":
+                        break
+                    time.sleep(3)
+        except Exception as e:  # noqa: BLE001
+            print(f"  skip (detach policy engine from gateway): {type(e).__name__}")
+
         _try(
             f"gateway {cfg.GATEWAY_ID}",
             lambda: br_ctrl.delete_gateway(gatewayIdentifier=cfg.GATEWAY_ID),
         )
 
+        # Wait for the gateway to finish deleting before touching the policy engine.
+        # The API returns immediately but the resource lingers in DELETING state;
+        # deleting the engine while the gateway still exists returns ConflictException.
+        for _ in range(30):
+            try:
+                g = br_ctrl.get_gateway(gatewayIdentifier=cfg.GATEWAY_ID)
+                if g["status"] not in ("DELETING", "DELETE_UNSUCCESSFUL"):
+                    break
+            except Exception:
+                break  # gateway is gone
+            time.sleep(5)
+
     if getattr(cfg, "GATEWAY_ENGINE_ID", ""):
+        # Delete all Cedar policies in the engine first.
+        # The engine cannot be deleted while it contains policies.
+        # IMPORTANT: list_policies() always returns empty (API bug as of 2026-05-21).
+        # list_policy_summaries() is the working alternative.
+        try:
+            policies = br_ctrl.list_policy_summaries(policyEngineId=cfg.GATEWAY_ENGINE_ID).get(
+                "policies", []
+            )
+            for pol in policies:
+                _try(
+                    f"Cedar policy {pol['name']} ({pol['policyId']})",
+                    lambda pid=pol["policyId"]: br_ctrl.delete_policy(
+                        policyEngineId=cfg.GATEWAY_ENGINE_ID, policyId=pid
+                    ),
+                )
+            if policies:
+                # Policy deletes are async; wait for them to settle before
+                # deleting the engine (which requires zero policies remaining).
+                for _ in range(20):
+                    remaining = br_ctrl.list_policy_summaries(
+                        policyEngineId=cfg.GATEWAY_ENGINE_ID
+                    ).get("policies", [])
+                    if not remaining:
+                        break
+                    time.sleep(3)
+        except Exception as e:  # noqa: BLE001
+            print(f"  skip (list Cedar policies): {type(e).__name__}")
+
         _try(
             f"policy engine {cfg.GATEWAY_ENGINE_ID}",
             lambda: br_ctrl.delete_policy_engine(policyEngineId=cfg.GATEWAY_ENGINE_ID),
