@@ -55,6 +55,14 @@ Open `config.py` and fill in your account ID and S3 bucket name:
 REGION     = "us-west-2"
 ACCOUNT_ID = "123456789012"       # your 12-digit account ID
 BUCKET     = "my-corpus-bucket"  # an S3 bucket you own
+
+# IMPORTANT: Use US inference profile IDs (start with "us.")
+MODELS = {
+    "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "sonnet": "us.anthropic.claude-sonnet-4-6",
+    "opus": "us.anthropic.claude-opus-4-7",
+    "nova": "us.amazon.nova-pro-v1:0",
+}
 ```
 
 ### 3. Fetch the paper corpus

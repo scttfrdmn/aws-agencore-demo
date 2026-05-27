@@ -29,12 +29,13 @@ VECTOR_BUCKET_NAME = "inside-the-lines-vectors"  # S3 Vectors bucket
 VECTOR_INDEX_NAME = "inside-the-lines-index"
 
 # --- models -------------------------------------------------------------
-# Verify the Claude + Nova inference-profile IDs against your account:
-#   aws bedrock list-inference-profiles --region us-west-2
+# IMPORTANT: Use US cross-region inference profile IDs (start with "us.")
+# Foundation model IDs (without "us." prefix) will fail with ValidationException.
+# Verify available profiles: aws bedrock list-inference-profiles --region us-west-2
 MODELS = {
     "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "sonnet": "us.anthropic.claude-sonnet-4-6-v1:0",
-    "opus": "us.anthropic.claude-opus-4-6-v1:0",
+    "sonnet": "us.anthropic.claude-sonnet-4-6",
+    "opus": "us.anthropic.claude-opus-4-7",
     "nova": "us.amazon.nova-pro-v1:0",  # the non-Claude cross-check
 }
 EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"

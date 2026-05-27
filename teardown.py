@@ -216,13 +216,44 @@ if __name__ == "__main__":
         )
 
     # --- Knowledge base ---------------------------------------------------
-    # The KB itself has no storage cost -- the vectors live in S3 Vectors.
-    # Deleting the KB removes the metadata and retrieval endpoint.
+    # CRITICAL ORDERING: Delete the KB BEFORE the vector store.
+    #
+    # When delete_knowledge_base() is called, Bedrock attempts to clean up
+    # all data from the underlying vector store. If the vector store is already
+    # gone, the KB gets stuck in DELETE_UNSUCCESSFUL status.
+    #
+    # Correct order:
+    #   1. Delete KB (triggers async cleanup of vector data)
+    #   2. Wait for KB deletion to complete
+    #   3. Delete S3 Vectors index
+    #   4. Delete S3 Vectors bucket
     if cfg.KB_ID:
         _try(
             f"knowledge base {cfg.KB_ID}",
             lambda: agent.delete_knowledge_base(knowledgeBaseId=cfg.KB_ID),
         )
+
+        # Wait for KB deletion to complete before touching the vector store.
+        # If we delete the vector store while the KB is still cleaning up,
+        # the KB will fail and get stuck in DELETE_UNSUCCESSFUL.
+        print("  waiting for KB deletion to complete...")
+        for _ in range(60):  # up to 5 minutes
+            try:
+                kb_detail = agent.get_knowledge_base(knowledgeBaseId=cfg.KB_ID)
+                kb_status = kb_detail["knowledgeBase"]["status"]
+                if kb_status == "DELETING":
+                    time.sleep(5)
+                    continue
+                if kb_status == "DELETE_UNSUCCESSFUL":
+                    print("  warning: KB stuck in DELETE_UNSUCCESSFUL (safe to continue)")
+                    break
+                # Unexpected status, but continue anyway
+                break
+            except Exception as e:
+                # KB not found = successfully deleted
+                if "ResourceNotFoundException" in str(type(e).__name__):
+                    print("  KB deletion confirmed")
+                break
 
     # Delete the S3 Vectors index first (must be empty or the bucket delete fails).
     # Cost while running: ~$0.05/GB-month for the vector data.
