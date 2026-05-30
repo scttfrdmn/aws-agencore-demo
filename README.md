@@ -132,7 +132,7 @@ make demo-fake-ingest
 ## Teardown
 
 ```bash
-AWS_PROFILE=your-profile python teardown.py
+AWS_PROFILE=your-profile make teardown
 ```
 
 Deletes the Knowledge Base, S3 Vectors store, Guardrail, AgentCore Gateway,
