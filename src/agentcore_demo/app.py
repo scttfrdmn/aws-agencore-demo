@@ -52,6 +52,7 @@ import json
 import os
 import threading
 import webbrowser
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
@@ -64,27 +65,24 @@ from agentcore_demo.cost import CostMeter
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI()
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 # ── auto-open browser on startup ─────────────────────────────────────────────
 # _launch_config is populated by __main__ before uvicorn starts.
-# The "startup" event fires once per process, inside the uvicorn event loop.
 _launch_config: dict = {}
 
 
-@app.on_event("startup")
-async def _on_startup() -> None:
-    """Open the browser once the server is ready.
-
-    The 0.5s delay gives uvicorn time to finish binding the port before
-    the browser tries to connect.  Without it, the first load sometimes
-    hits a "connection refused" if the browser is faster than the server.
-    """
+@asynccontextmanager
+async def _lifespan(app: FastAPI):  # noqa: ARG001
+    # Open the browser once on startup.  The 0.5s delay lets uvicorn finish
+    # binding the port before the browser tries to connect.
     url = _launch_config.get("browser_url")
     if url:
         await asyncio.sleep(0.5)
         await asyncio.to_thread(webbrowser.open, url)
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ── singleton backend ─────────────────────────────────────────────────────────

@@ -83,7 +83,7 @@ AWS_PROFILE=your-profile aws s3 sync corpus/ s3://YOUR-BUCKET/corpus/ --region u
 ### 5. Provision all AWS resources
 
 ```bash
-AWS_PROFILE=your-profile python build_kb.py
+AWS_PROFILE=your-profile make build-kb
 ```
 
 This takes about 10 minutes. It creates the IAM role, S3 Vectors store,
